@@ -1,0 +1,46 @@
+{
+  "name": "@allstak/next",
+  "version": "0.1.0-beta.1",
+  "description": "Standalone AllStak Next.js SDK with source-map upload support. No @allstak/* runtime dependencies.",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allstak-io/allstak-next.git"
+  },
+  "homepage": "https://allstak.sa",
+  "bugs": {
+    "url": "https://github.com/allstak-io/allstak-next/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
+    "test": "vitest run",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "peerDependencies": {
+    "next": ">=13.0.0"
+  },
+  "peerDependenciesMeta": {
+    "next": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.6.1"
+  },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
