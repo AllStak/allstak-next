@@ -15,11 +15,11 @@
   "files": ["dist", "README.md", "LICENSE"],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/allstak-io/allstak-next.git"
+    "url": "git+https://github.com/AllStak/allstak-next.git"
   },
   "homepage": "https://allstak.sa",
   "bugs": {
-    "url": "https://github.com/allstak-io/allstak-next/issues"
+    "url": "https://github.com/AllStak/allstak-next/issues"
   },
   "publishConfig": {
     "access": "public"
