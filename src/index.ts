@@ -2,6 +2,32 @@ import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+// ── Re-exports from the consolidated client/middleware/integration surface ──
+// Restores the public API that shipped on @allstak/next@0.1.0; the
+// short-circuit publish of 0.1.1 missed these because index.ts didn't
+// re-export from the freshly-tracked source files.
+export {
+  AllStakNextClient,
+  getClient,
+  setClient,
+  parseStack,
+  formatFrames,
+  type AllStakNextClientOptions,
+  type Breadcrumb,
+  type BreadcrumbType,
+  type BreadcrumbCategory,
+  type ErrorPayload,
+  type SeverityLevel,
+  type StackFrame,
+  type DebugImage,
+} from './client';
+export { resolveDebugId, _resetDebugIdCache } from './utils/debug-id';
+export { AllStakErrorBoundary, withAllStakErrorBoundary, type AllStakErrorBoundaryProps } from './error-boundary';
+export { registerAllStak, type RegisterAllStakOptions } from './instrumentation';
+export { captureUnderscoreErrorException, type NextErrorContext } from './pages-error';
+export { installGlobalErrorHandlers } from './client-hooks';
+export { withAllStakMiddleware } from './middleware';
+
 const DEFAULT_HOST = 'https://api.allstak.sa';
 
 export interface AllStakNextConfig {
