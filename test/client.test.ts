@@ -41,7 +41,7 @@ describe('AllStakNextClient', () => {
     expect(body.timestamp).toBeTypeOf('string');
     expect(() => new Date(body.timestamp).toISOString()).not.toThrow();
     expect(body.sdkName).toBe('@allstak/next');
-    expect(body.sdkVersion).toBe('0.1.0');
+    expect(body.sdkVersion).toBe('0.1.1');
     expect(body.platform).toBe('node');
     expect(body.stackTrace).toBeInstanceOf(Array);
     if (body.stackTrace.length > 0) {
