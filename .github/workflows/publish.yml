@@ -58,7 +58,7 @@ jobs:
           cp "$TARBALL" "$TMP/package.tgz"
           cd "$TMP"
           npm init -y >/dev/null
-          npm install --ignore-scripts ./package.tgz typescript >/dev/null
+          npm install --ignore-scripts ./package.tgz typescript react >/dev/null
           node -e "const sdk=require('@allstak/next'); if (!sdk.initAllStakNext) throw new Error('missing CJS export')"
           node --input-type=module -e "const sdk=await import('@allstak/next'); if (!sdk.initAllStakNext) throw new Error('missing ESM export')"
           printf "import { initAllStakNext } from '@allstak/next';\\nvoid initAllStakNext;\\n" > smoke.ts
