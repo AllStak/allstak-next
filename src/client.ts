@@ -2,6 +2,8 @@ import { resolveDebugId } from './utils/debug-id';
 import { scrub } from './sanitize';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
+export const SDK_NAME = '@allstak/next';
+export const SDK_VERSION = '0.1.3';
 const TRANSPORT_TIMEOUT_MS = 3000;
 const MAX_BREADCRUMBS = 30;
 
@@ -47,6 +49,38 @@ export interface ErrorPayload {
   sdkVersion: string;
   platform: string;
   debugMeta?: { images: DebugImage[] };
+}
+
+export interface SpanPayload {
+  traceId: string;
+  spanId: string;
+  parentSpanId: string;
+  operation: string;
+  description: string;
+  status: 'ok' | 'error' | 'timeout';
+  durationMs: number;
+  startTimeMillis: number;
+  endTimeMillis: number;
+  service: string;
+  environment: string;
+  tags: Record<string, string>;
+  data: string;
+}
+
+export interface HttpRequestPayload {
+  traceId: string;
+  requestId: string;
+  spanId?: string;
+  parentSpanId?: string;
+  direction: 'inbound' | 'outbound';
+  method: string;
+  host: string;
+  path: string;
+  statusCode: number;
+  durationMs: number;
+  environment?: string;
+  release?: string;
+  timestamp: string;
 }
 
 export interface AllStakNextClientOptions {
@@ -110,10 +144,10 @@ export class AllStakNextClient {
       environment: this.environment,
       release: this.release,
       breadcrumbs: [...this.breadcrumbs],
-      metadata: { sdkName: '@allstak/next', sdkVersion: '0.1.1', ...context },
+      metadata: { sdkName: SDK_NAME, sdkVersion: SDK_VERSION, ...context },
       timestamp: new Date().toISOString(),
-      sdkName: '@allstak/next',
-      sdkVersion: '0.1.1',
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
       platform: 'node',
       debugMeta,
     };
@@ -131,13 +165,29 @@ export class AllStakNextClient {
       environment: this.environment,
       release: this.release,
       breadcrumbs: [...this.breadcrumbs],
-      metadata: { sdkName: '@allstak/next', sdkVersion: '0.1.1' },
+      metadata: { sdkName: SDK_NAME, sdkVersion: SDK_VERSION },
       timestamp: new Date().toISOString(),
-      sdkName: '@allstak/next',
-      sdkVersion: '0.1.1',
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
       platform: 'node',
     };
     await this.send('/ingest/v1/errors', payload);
+  }
+
+  async captureSpan(span: SpanPayload): Promise<void> {
+    if (this.destroyed || !this.apiKey) return;
+    await this.send('/ingest/v1/spans', { spans: [span] });
+  }
+
+  async captureRequest(request: HttpRequestPayload): Promise<void> {
+    if (this.destroyed || !this.apiKey) return;
+    await this.send('/ingest/v1/http-requests', {
+      requests: [{
+        ...request,
+        environment: request.environment ?? this.environment,
+        release: request.release ?? this.release,
+      }],
+    });
   }
 
   async flush(): Promise<void> {
@@ -159,13 +209,21 @@ export class AllStakNextClient {
     return this.breadcrumbs;
   }
 
-  private async send(path: string, payload: ErrorPayload): Promise<void> {
+  getEnvironment(): string {
+    return this.environment;
+  }
+
+  getRelease(): string {
+    return this.release;
+  }
+
+  private async send(path: string, payload: unknown): Promise<void> {
     const request = this.doFetch(path, payload);
     this.pendingRequests.push(request);
     await request;
   }
 
-  private async doFetch(path: string, payload: ErrorPayload): Promise<void> {
+  private async doFetch(path: string, payload: unknown): Promise<void> {
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), TRANSPORT_TIMEOUT_MS);

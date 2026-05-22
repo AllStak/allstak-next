@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -27,6 +27,13 @@ export { registerAllStak, type RegisterAllStakOptions } from './instrumentation'
 export { captureUnderscoreErrorException, type NextErrorContext } from './pages-error';
 export { installGlobalErrorHandlers } from './client-hooks';
 export { withAllStakMiddleware } from './middleware';
+export {
+  withAllStakRouteHandler,
+  withAllStakServerAction,
+  createRouteTelemetryContext,
+  type RouteTelemetryContext,
+  type ServerActionTelemetryOptions,
+} from './route-handler';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 
@@ -37,6 +44,7 @@ export interface AllStakNextConfig {
   release?: string;
   uploadToken?: string;
   dist?: string;
+  tunnelRoute?: string;
 }
 
 export interface SourceMapUploadOptions {
@@ -45,6 +53,7 @@ export interface SourceMapUploadOptions {
   uploadToken: string;
   host?: string;
   dist?: string;
+  deleteAfterUpload?: boolean;
 }
 
 export function initAllStakNext(config: AllStakNextConfig): void {
@@ -93,37 +102,96 @@ export async function processNextSourceMaps(options: SourceMapUploadOptions): Pr
       body: form,
     });
     if (!response.ok) throw new Error(`AllStak source-map upload failed: HTTP ${response.status}`);
+    if (options.deleteAfterUpload) {
+      try {
+        unlinkSync(pair.map);
+      } catch {
+        /* non-fatal cleanup */
+      }
+    }
     uploaded++;
   }
   return { pairs: pairs.length, uploaded };
 }
 
-export function withAllStak(allstak: Partial<SourceMapUploadOptions>, nextConfig: Record<string, unknown> = {}): Record<string, unknown> {
+export interface WithAllStakOptions extends Partial<SourceMapUploadOptions> {
+  tunnelRoute?: string;
+  silent?: boolean;
+}
+
+export function withAllStak(allstak: WithAllStakOptions, nextConfig: Record<string, unknown> = {}): Record<string, unknown> {
   const userWebpack = nextConfig.webpack as ((config: any, ctx: any) => any) | undefined;
+  const userRewrites = nextConfig.rewrites as (() => unknown | Promise<unknown>) | undefined;
+  const tunnelRoute = normalizeTunnelRoute(allstak.tunnelRoute);
   return {
     ...nextConfig,
     productionBrowserSourceMaps: nextConfig.productionBrowserSourceMaps ?? true,
+    ...(tunnelRoute ? {
+      async rewrites() {
+        const existing = typeof userRewrites === 'function' ? await userRewrites() : [];
+        const tunnelRewrite = {
+          source: tunnelRoute,
+          destination: `${(allstak.host || DEFAULT_HOST).replace(/\/$/, '')}/ingest/v1/:path*`,
+        };
+        return mergeRewrite(tunnelRewrite, existing);
+      },
+    } : {}),
     webpack(config: any, ctx: any) {
+      config.plugins = config.plugins || [];
+      config.plugins.push({
+        apply(compiler: any) {
+          compiler.hooks?.environment?.tap?.('AllStakNextEnvironment', () => {
+            compiler.options = compiler.options || {};
+            compiler.options.plugins = compiler.options.plugins || [];
+          });
+        },
+      });
+
       if (!ctx?.isServer && !ctx?.dev && allstak.release && allstak.uploadToken) {
         const plugin = {
           apply(compiler: any) {
             compiler.hooks.afterEmit.tapPromise('AllStakNextSourceMaps', async () => {
-              await processNextSourceMaps({
-                dir: compiler.outputPath,
-                release: allstak.release!,
-                uploadToken: allstak.uploadToken!,
-                host: allstak.host,
-                dist: allstak.dist,
-              });
+              try {
+                await processNextSourceMaps({
+                  dir: compiler.outputPath,
+                  release: allstak.release!,
+                  uploadToken: allstak.uploadToken!,
+                  host: allstak.host,
+                  dist: allstak.dist,
+                  deleteAfterUpload: allstak.deleteAfterUpload,
+                });
+              } catch (error) {
+                if (allstak.silent === false) throw error;
+              }
             });
           },
         };
-        config.plugins = config.plugins || [];
         config.plugins.push(plugin);
       }
       return userWebpack ? userWebpack(config, ctx) : config;
     },
   };
+}
+
+function normalizeTunnelRoute(route: string | undefined): string | undefined {
+  if (!route) return undefined;
+  const trimmed = route.trim();
+  if (!trimmed) return undefined;
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function mergeRewrite(tunnelRewrite: Record<string, string>, existing: unknown): unknown {
+  if (Array.isArray(existing)) {
+    return [tunnelRewrite, ...existing];
+  }
+  if (existing && typeof existing === 'object') {
+    const grouped = existing as { beforeFiles?: unknown[] };
+    return {
+      ...grouped,
+      beforeFiles: [tunnelRewrite, ...(Array.isArray(grouped.beforeFiles) ? grouped.beforeFiles : [])],
+    };
+  }
+  return [tunnelRewrite];
 }
 
 function findPairs(dir: string): Array<{ js: string; map: string; jsName: string; mapName: string }> {

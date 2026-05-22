@@ -44,7 +44,7 @@ describe('withAllStakMiddleware', () => {
   });
 
   it('captures errors and re-throws', async () => {
-    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.dev.allstak.sa' });
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
     const captureSpy = vi.spyOn(client, 'captureException');
     setClient(client);
 

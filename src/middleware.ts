@@ -1,7 +1,8 @@
-import { getClient } from './client';
+import { getClient, type SpanPayload } from './client';
+import { createRouteTelemetryContext, setTraceHeaders, type RouteTelemetryContext } from './route-handler';
 
 type NextRequest = { headers: Headers; url: string; method: string };
-type NextResponse = { headers: Headers };
+type NextResponse = { headers: Headers; status?: number };
 type MiddlewareHandler = (request: NextRequest) => NextResponse | Promise<NextResponse>;
 
 /**
@@ -19,22 +20,18 @@ type MiddlewareHandler = (request: NextRequest) => NextResponse | Promise<NextRe
  */
 export function withAllStakMiddleware(handler: MiddlewareHandler): MiddlewareHandler {
   return async (request: NextRequest) => {
-    const traceId = generateTraceId();
-    const startTime = Date.now();
+    const telemetry = createRouteTelemetryContext(request);
 
     try {
       const response = await handler(request);
+      const endTimeMillis = Date.now();
 
-      // Add trace headers to the response
-      try {
-        response.headers.set('x-allstak-trace-id', traceId);
-        response.headers.set('server-timing', `allstak;dur=${Date.now() - startTime}`);
-      } catch {
-        // Headers may be immutable in some contexts
-      }
+      setTraceHeaders(response.headers, telemetry, endTimeMillis);
 
+      await captureMiddlewareTelemetry(telemetry, response.status ?? 200, endTimeMillis);
       return response;
     } catch (error) {
+      const endTimeMillis = Date.now();
       try {
         const client = getClient();
         if (client) {
@@ -43,23 +40,69 @@ export function withAllStakMiddleware(handler: MiddlewareHandler): MiddlewareHan
             mechanism: 'middleware',
             url: request.url,
             method: request.method,
-            traceId,
+            traceId: telemetry.traceId,
+            requestId: telemetry.requestId,
           });
         }
       } catch {
         // fail-open
       }
+      await captureMiddlewareTelemetry(telemetry, 500, endTimeMillis, 'error');
       throw error; // re-throw so Next.js handles it
     }
   };
 }
 
-function generateTraceId(): string {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID();
+async function captureMiddlewareTelemetry(
+  telemetry: RouteTelemetryContext,
+  statusCode: number,
+  endTimeMillis: number,
+  forcedStatus?: SpanPayload['status'],
+): Promise<void> {
+  const client = getClient();
+  if (!client) return;
+
+  const durationMs = Math.max(0, endTimeMillis - telemetry.startTimeMillis);
+  await Promise.allSettled([
+    failOpen(() => client.captureRequest({
+      traceId: telemetry.traceId,
+      requestId: telemetry.requestId,
+      spanId: telemetry.spanId,
+      parentSpanId: telemetry.parentSpanId,
+      direction: 'inbound',
+      method: telemetry.method,
+      host: telemetry.host,
+      path: telemetry.path,
+      statusCode,
+      durationMs,
+      timestamp: new Date(endTimeMillis).toISOString(),
+    })),
+    failOpen(() => client.captureSpan({
+      traceId: telemetry.traceId,
+      spanId: telemetry.spanId,
+      parentSpanId: telemetry.parentSpanId,
+      operation: 'next.middleware',
+      description: `${telemetry.method} ${telemetry.path}`,
+      status: forcedStatus ?? (statusCode >= 500 ? 'error' : 'ok'),
+      durationMs,
+      startTimeMillis: telemetry.startTimeMillis,
+      endTimeMillis,
+      service: 'nextjs',
+      environment: client.getEnvironment(),
+      tags: {
+        component: 'middleware',
+        method: telemetry.method,
+        statusCode: String(statusCode),
+      },
+      data: JSON.stringify({ host: telemetry.host, path: telemetry.path }),
+    })),
+  ]);
+}
+
+async function failOpen(work: () => Promise<void>): Promise<void> {
+  try {
+    await work();
+  } catch {
+    // Telemetry must never affect middleware control flow.
   }
-  // Fallback for environments without crypto.randomUUID
-  return Array.from({ length: 32 }, () =>
-    Math.floor(Math.random() * 16).toString(16),
-  ).join('');
 }

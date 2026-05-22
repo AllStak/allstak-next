@@ -17,7 +17,7 @@ describe('AllStakNextClient', () => {
   it('sends structured error payload with captureException', async () => {
     const client = new AllStakNextClient({
       apiKey: 'ask_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
       environment: 'test',
       release: '1.0.0',
     });
@@ -26,7 +26,7 @@ describe('AllStakNextClient', () => {
 
     expect(fetchSpy).toHaveBeenCalledOnce();
     const [url, init] = fetchSpy.mock.calls[0];
-    expect(url).toBe('https://api.dev.allstak.sa/ingest/v1/errors');
+    expect(url).toBe('https://api.allstak.sa/ingest/v1/errors');
     expect(init.method).toBe('POST');
     expect(init.headers['X-AllStak-Key']).toBe('ask_test');
 
@@ -41,7 +41,7 @@ describe('AllStakNextClient', () => {
     expect(body.timestamp).toBeTypeOf('string');
     expect(() => new Date(body.timestamp).toISOString()).not.toThrow();
     expect(body.sdkName).toBe('@allstak/next');
-    expect(body.sdkVersion).toBe('0.1.1');
+    expect(body.sdkVersion).toBe('0.1.3');
     expect(body.platform).toBe('node');
     expect(body.stackTrace).toBeInstanceOf(Array);
     if (body.stackTrace.length > 0) {
@@ -53,7 +53,7 @@ describe('AllStakNextClient', () => {
   it('sends message payload with captureMessage', async () => {
     const client = new AllStakNextClient({
       apiKey: 'ask_test',
-      host: 'https://api.dev.allstak.sa',
+      host: 'https://api.allstak.sa',
     });
     await client.captureMessage('hello world', 'warning');
 
@@ -131,10 +131,10 @@ describe('AllStakNextClient', () => {
   it('strips trailing slash from host', async () => {
     const client = new AllStakNextClient({
       apiKey: 'ask_test',
-      host: 'https://api.dev.allstak.sa/',
+      host: 'https://api.allstak.sa/',
     });
     await client.captureException(new Error('slash'));
-    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.dev.allstak.sa/ingest/v1/errors');
+    expect(fetchSpy.mock.calls[0][0]).toBe('https://api.allstak.sa/ingest/v1/errors');
   });
 
   it('uses endpoint as alias for host', async () => {

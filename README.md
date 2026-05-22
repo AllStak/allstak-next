@@ -1,174 +1,115 @@
 # @allstak/next
 
-Next.js SDK for [AllStak](https://app.allstak.sa) -- automatic error tracking, source-map upload, and observability for Next.js applications.
+AllStak SDK for Next.js App Router and Pages Router. Captures server errors, client errors, route-handler errors, middleware errors, and uploads source maps.
 
-[![npm version](https://img.shields.io/npm/v/@allstak/next.svg)](https://www.npmjs.com/package/@allstak/next)
-[![license](https://img.shields.io/npm/l/@allstak/next.svg)](./LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue.svg)](https://www.typescriptlang.org/)
-[![Next.js](https://img.shields.io/badge/Next.js-13%2B-black.svg)](https://nextjs.org/)
+## Install
 
-> **Beta** -- actively evolving. Validated for App Router and Pages Router.
-
-```sh
+```bash
 npm install @allstak/next
 ```
 
-## Features
+## App Router
 
-- Server-side error capture via Next.js instrumentation hooks
-- Client-side error boundaries and global handlers
-- Middleware integration for edge-runtime errors
-- Automatic source-map upload during builds
-- Standalone source-map upload for CI pipelines
-- Manual error and message capture API
-- Zero `@allstak/*` runtime dependencies -- fully self-contained
-
-## App Router Setup
-
-### 1. Instrumentation (server-side)
+Create `instrumentation.ts`:
 
 ```ts
-// instrumentation.ts
 export async function register() {
-  const { registerAllStak } = await import("@allstak/next");
+  const { registerAllStak } = await import('@allstak/next');
+
   registerAllStak({
     apiKey: process.env.ALLSTAK_API_KEY,
-    host: "https://api.allstak.sa",
-    environment: process.env.NODE_ENV,
+    environment: process.env.NODE_ENV ?? 'production',
     release: process.env.NEXT_PUBLIC_RELEASE,
   });
 }
 ```
 
-### 2. Error boundary (client-side)
+Wrap client components when you want a local fallback:
 
 ```tsx
-// app/error.tsx
-"use client";
-import { AllStakErrorBoundary } from "@allstak/next";
+'use client';
 
-export default function ErrorPage({ error }: { error: Error }) {
-  return <p>Something went wrong: {error.message}</p>;
+import { withAllStakErrorBoundary } from '@allstak/next';
+
+function PageContent() {
+  return <AppContent />;
 }
-```
 
-Or wrap any component:
-
-```tsx
-import { withAllStakErrorBoundary } from "@allstak/next";
-export default withAllStakErrorBoundary(MyComponent, {
-  fallback: <p>Something went wrong</p>,
+export default withAllStakErrorBoundary(PageContent, {
+  fallback: <p>Something went wrong.</p>,
 });
 ```
 
-### 3. Global client-side handlers
-
-```tsx
-// app/providers.tsx
-"use client";
-import { useEffect } from "react";
-import { installGlobalErrorHandlers } from "@allstak/next";
-
-export function AllStakProvider({ children }: { children: React.ReactNode }) {
-  useEffect(() => installGlobalErrorHandlers(), []);
-  return <>{children}</>;
-}
-```
-
-### 4. Middleware
+## Route handlers
 
 ```ts
-// middleware.ts
-import { withAllStakMiddleware } from "@allstak/next";
-import { NextResponse } from "next/server";
+import { withAllStakRouteHandler } from '@allstak/next';
 
-export default withAllStakMiddleware(async () => {
-  return NextResponse.next();
+export const GET = withAllStakRouteHandler(async () => {
+  return Response.json({ ok: true });
 });
 ```
 
-## Pages Router Setup
+## Pages Router
 
-```tsx
-// pages/_error.tsx
-import { captureUnderscoreErrorException } from "@allstak/next";
-import NextErrorComponent from "next/error";
+```ts
+// pages/_app.tsx
+import { installGlobalErrorHandlers } from '@allstak/next';
+import { useEffect } from 'react';
 
-function CustomError({ statusCode }: { statusCode: number }) {
-  return <NextErrorComponent statusCode={statusCode} />;
+export default function App({ Component, pageProps }) {
+  useEffect(() => installGlobalErrorHandlers(), []);
+  return <Component {...pageProps} />;
 }
-
-CustomError.getInitialProps = async (ctx: any) => {
-  await captureUnderscoreErrorException(ctx);
-  return NextErrorComponent.getInitialProps(ctx);
-};
-
-export default CustomError;
 ```
 
-## Source Maps
-
-### next.config.js wrapper
+## Source maps
 
 ```js
-const { withAllStak } = require("@allstak/next");
+const { withAllStak } = require('@allstak/next');
 
-module.exports = withAllStak(
-  {
-    release: process.env.NEXT_PUBLIC_RELEASE,
-    uploadToken: process.env.ALLSTAK_UPLOAD_TOKEN,
-  },
-  {
-    // your existing next.config.js options
-  }
-);
-```
-
-### Standalone upload (CI)
-
-```ts
-import { processNextSourceMaps } from "@allstak/next";
-
-await processNextSourceMaps({
-  dir: ".next",
-  release: "1.0.0",
-  uploadToken: process.env.ALLSTAK_UPLOAD_TOKEN!,
+module.exports = withAllStak({
+  release: process.env.NEXT_PUBLIC_RELEASE,
+  uploadToken: process.env.ALLSTAK_UPLOAD_TOKEN,
+}, {
+  reactStrictMode: true,
 });
 ```
 
-## Manual Capture
+## Manual capture
 
 ```ts
-import { initAllStakNext } from "@allstak/next";
+import { captureException, initAllStakNext } from '@allstak/next';
 
-const client = initAllStakNext({
+initAllStakNext({
   apiKey: process.env.ALLSTAK_API_KEY,
-  host: "https://api.allstak.sa",
+  environment: process.env.NODE_ENV ?? 'production',
+  release: process.env.NEXT_PUBLIC_RELEASE,
 });
 
-client.captureException(new Error("something broke"));
-client.captureMessage("deployment started", "info");
+await captureException(new Error('checkout failed'), {
+  route: '/checkout',
+});
 ```
 
 ## Configuration
 
-| Option          | Type     | Required | Description                            |
-| --------------- | -------- | -------- | -------------------------------------- |
-| `apiKey`        | `string` | Yes      | Project API key from AllStak dashboard |
-| `host`          | `string` | Yes      | Ingest endpoint URL                    |
-| `environment`   | `string` | No       | Deployment environment name            |
-| `release`       | `string` | No       | Release or version identifier          |
-| `uploadToken`   | `string` | No       | Token for source-map uploads           |
+| Option | Description |
+| --- | --- |
+| `apiKey` | Project API key. |
+| `host` | Optional ingest host override for self-hosted AllStak. |
+| `environment` | Deployment environment. |
+| `release` | App version or commit SHA. |
+| `uploadToken` | Source-map upload token. |
+| `dist` | Optional build distribution name. |
+| `tunnelRoute` | Optional browser ingest tunnel route. |
 
-### Self-hosted deployments
+## Troubleshooting
 
-Set `host` to your own AllStak instance URL (e.g. `https://allstak.internal.example.com`).
-
-## Links
-
-- [Dashboard](https://app.allstak.sa)
-- [Documentation](https://docs.allstak.sa)
+- Server errors missing: ensure `instrumentation.ts` is enabled in your Next.js version.
+- Client errors missing: install global handlers or use the error boundary helper.
+- Source maps missing: use the same release value in runtime config and source-map upload.
 
 ## License
 
-[MIT](./LICENSE)
+MIT

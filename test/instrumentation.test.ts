@@ -56,7 +56,7 @@ describe('registerAllStak', () => {
   });
 
   it('uncaughtException handler captures to client', async () => {
-    const client = registerAllStak({ apiKey: 'ask_test', host: 'https://api.dev.allstak.sa' });
+    const client = registerAllStak({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
     const captureSpy = vi.spyOn(client, 'captureException');
 
     // Find the handler that was installed
@@ -64,7 +64,7 @@ describe('registerAllStak', () => {
     // Re-register to capture the spy
     client.destroy();
     setClient(null);
-    const newClient = registerAllStak({ apiKey: 'ask_test', host: 'https://api.dev.allstak.sa' });
+    const newClient = registerAllStak({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
     const captureSpyNew = vi.spyOn(newClient, 'captureException');
 
     const uncaughtCall = onSpy.mock.calls.find(c => c[0] === 'uncaughtException');

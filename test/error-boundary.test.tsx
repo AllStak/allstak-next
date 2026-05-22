@@ -26,7 +26,7 @@ describe('AllStakErrorBoundary', () => {
   });
 
   it('componentDidCatch sends error to AllStak client', () => {
-    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.dev.allstak.sa' });
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
     const captureSpy = vi.spyOn(client, 'captureException');
     setClient(client);
 
