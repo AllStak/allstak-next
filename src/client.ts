@@ -1,6 +1,7 @@
 import { resolveDebugId } from './utils/debug-id';
 import { scrub } from './sanitize';
 import { getActiveMergedScope, type MergedScopeData } from './scope';
+import { resolveRelease, type GitRunner } from './release';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
@@ -147,6 +148,16 @@ export interface AllStakNextClientOptions {
   beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
   /** RNG seam for deterministic tests. Defaults to Math.random. Returns [0,1). */
   random?: () => number;
+  /**
+   * Auto-detect the release when `release` is not set: env vars (ALLSTAK_RELEASE,
+   * VERCEL_GIT_COMMIT_SHA, …), then local git at init (Node server runtime only),
+   * then the SDK version so release is never empty. Default true. Set false to
+   * gate off the git lookup and version fallback. The git step never runs on the
+   * Next.js edge or browser runtimes — there it resolves from env/version only.
+   */
+  autoDetectRelease?: boolean;
+  /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
+  gitRunner?: GitRunner;
 }
 
 function clamp01(n: number | undefined): number {
@@ -172,7 +183,15 @@ export class AllStakNextClient {
     this.apiKey = options.apiKey || options.dsn || '';
     this.host = (options.host || options.endpoint || DEFAULT_HOST).replace(/\/$/, '');
     this.environment = options.environment || '';
-    this.release = options.release || '';
+    // Resolve the release: explicit config > env vars > local git (Node server
+    // runtime only) > SDK version. resolveRelease guards the git step itself,
+    // so this is safe on the edge/browser bundle (git is skipped there).
+    this.release = resolveRelease({
+      explicit: options.release,
+      autoDetectRelease: options.autoDetectRelease,
+      gitRunner: options.gitRunner,
+      version: SDK_VERSION,
+    });
     this.sampleRate = clamp01(options.sampleRate);
     this.beforeSend = options.beforeSend;
     this.random = options.random || Math.random;

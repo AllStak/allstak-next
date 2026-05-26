@@ -34,6 +34,17 @@ export {
 export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
 export { resolveDebugId, _resetDebugIdCache } from './utils/debug-id';
+export {
+  resolveRelease,
+  resolveGitRelease,
+  detectReleaseFromEnv,
+  isNodeServerRuntime,
+  defaultGitRunner,
+  RELEASE_ENV_VARS,
+  _resetReleaseCache,
+  type GitRunner,
+  type ResolveReleaseOptions,
+} from './release';
 export { AllStakErrorBoundary, withAllStakErrorBoundary, type AllStakErrorBoundaryProps } from './error-boundary';
 export { registerAllStak, type RegisterAllStakOptions } from './instrumentation';
 export { captureUnderscoreErrorException, type NextErrorContext } from './pages-error';
