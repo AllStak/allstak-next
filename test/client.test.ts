@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { AllStakNextClient, parseStack, getClient, setClient } from '../src/client';
+import { AllStakNextClient, parseStack, getClient, setClient, parseRetryAfter } from '../src/client';
 
 describe('AllStakNextClient', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
@@ -176,5 +176,93 @@ describe('client singleton', () => {
     expect(getClient()).toBe(client);
     setClient(null);
     expect(getClient()).toBeNull();
+  });
+});
+
+describe('parseRetryAfter', () => {
+  const NOW = 1_700_000_000_000;
+
+  it('parses delta-seconds: "2" → 2000', () => {
+    expect(parseRetryAfter('2', NOW)).toBe(2000);
+  });
+
+  it('parses HTTP-date into a delta-from-now in ms', () => {
+    const future = new Date(NOW + 5000).toUTCString();
+    expect(parseRetryAfter(future, NOW)).toBe(5000);
+  });
+
+  it('returns 0 for null and empty string', () => {
+    expect(parseRetryAfter(null, NOW)).toBe(0);
+    expect(parseRetryAfter('', NOW)).toBe(0);
+    expect(parseRetryAfter('   ', NOW)).toBe(0);
+  });
+
+  it('returns 0 for garbage', () => {
+    expect(parseRetryAfter('soon', NOW)).toBe(0);
+    expect(parseRetryAfter('12.5', NOW)).toBe(0);
+    expect(parseRetryAfter('-3', NOW)).toBe(0);
+  });
+
+  it('clamps anything over 300s to 300000', () => {
+    expect(parseRetryAfter('400', NOW)).toBe(300_000);
+    expect(parseRetryAfter('301', NOW)).toBe(300_000);
+    expect(parseRetryAfter('300', NOW)).toBe(300_000);
+    const farFuture = new Date(NOW + 600_000).toUTCString();
+    expect(parseRetryAfter(farFuture, NOW)).toBe(300_000);
+  });
+
+  it('treats a past HTTP-date as 0', () => {
+    const past = new Date(NOW - 5000).toUTCString();
+    expect(parseRetryAfter(past, NOW)).toBe(0);
+  });
+});
+
+describe('transport Retry-After handling', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function headers(map: Record<string, string>) {
+    return { get: (name: string) => map[name] ?? map[name.toLowerCase()] ?? null };
+  }
+
+  it('waits the Retry-After delay and retries once on 429 with header', async () => {
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, status: 429, headers: headers({ 'Retry-After': '2' }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, headers: headers({}) });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    const promise = client.captureMessage('hi');
+
+    // First POST has fired; the retry is gated behind the 2s wait.
+    await Promise.resolve();
+    expect(fetchSpy).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry on a 2xx response', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, headers: headers({}) });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    await client.captureMessage('hi');
+    expect(fetchSpy).toHaveBeenCalledOnce();
+  });
+
+  it('does not retry on 429 when Retry-After is absent (preserves fail-open)', async () => {
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: false, status: 429, headers: headers({}) });
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    await client.captureMessage('hi');
+    expect(fetchSpy).toHaveBeenCalledOnce();
   });
 });

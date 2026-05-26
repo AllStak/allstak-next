@@ -6,6 +6,41 @@ export const SDK_NAME = '@allstak/next';
 export const SDK_VERSION = '0.1.3';
 const TRANSPORT_TIMEOUT_MS = 3000;
 const MAX_BREADCRUMBS = 30;
+/** Upper bound for any honored Retry-After delay. */
+const MAX_RETRY_AFTER_MS = 300_000;
+
+/**
+ * Parse an HTTP `Retry-After` header into a delay in milliseconds.
+ *
+ * Supports the two RFC 7231 forms:
+ *   - delta-seconds: a non-negative integer (e.g. "120" → 120000ms)
+ *   - HTTP-date: an absolute date; the delta from `now` is returned (clamped ≥ 0)
+ *
+ * Returns 0 when the header is absent, empty, or unparseable so callers can
+ * fall back to their computed backoff. The result is clamped to
+ * MAX_RETRY_AFTER_MS (300000). Pure and side-effect free.
+ */
+export function parseRetryAfter(headerValue: string | null, now: number): number {
+  if (headerValue == null) return 0;
+  const raw = headerValue.trim();
+  if (raw === '') return 0;
+
+  let ms: number;
+  if (/^\d+$/.test(raw)) {
+    // delta-seconds: a bare non-negative integer.
+    const seconds = Number(raw);
+    if (!Number.isFinite(seconds) || seconds < 0) return 0;
+    ms = seconds * 1000;
+  } else {
+    // HTTP-date form.
+    const when = Date.parse(raw);
+    if (Number.isNaN(when)) return 0;
+    const delta = when - now;
+    ms = delta > 0 ? delta : 0;
+  }
+
+  return Math.min(ms, MAX_RETRY_AFTER_MS);
+}
 
 export type BreadcrumbType = 'navigation' | 'ui' | 'http' | 'console' | 'custom';
 /** @deprecated Use BreadcrumbType instead */
@@ -225,32 +260,49 @@ export class AllStakNextClient {
 
   private async doFetch(path: string, payload: unknown): Promise<void> {
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), TRANSPORT_TIMEOUT_MS);
+      // Scrub the full wire payload before serialization. One chokepoint
+      // protects every telemetry type. Pure (no caller mutation),
+      // fail-open on sanitizer error.
+      let body: string;
       try {
-        // Scrub the full wire payload before serialization. One chokepoint
-        // protects every telemetry type. Pure (no caller mutation),
-        // fail-open on sanitizer error.
-        let body: string;
-        try {
-          body = JSON.stringify(scrub(payload));
-        } catch {
-          body = JSON.stringify(payload);
+        body = JSON.stringify(scrub(payload));
+      } catch {
+        body = JSON.stringify(payload);
+      }
+
+      const response = await this.postOnce(path, body);
+      // Honor a server-provided Retry-After on 429/503: wait the indicated
+      // delay (capped at MAX_RETRY_AFTER_MS) and retry exactly once. Any
+      // other status — including 429/503 without a usable header — keeps the
+      // existing fail-open, no-retry behavior.
+      if (response && (response.status === 429 || response.status === 503)) {
+        const headerValue = response.headers?.get?.('Retry-After') ?? null;
+        const waitMs = parseRetryAfter(headerValue, Date.now());
+        if (waitMs > 0) {
+          await new Promise((r) => setTimeout(r, waitMs));
+          await this.postOnce(path, body);
         }
-        await fetch(`${this.host}${path}`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-AllStak-Key': this.apiKey,
-          },
-          body,
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timeoutId);
       }
     } catch {
       // fail-open: never throw into the host app
+    }
+  }
+
+  private async postOnce(path: string, body: string): Promise<Response | undefined> {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), TRANSPORT_TIMEOUT_MS);
+    try {
+      return await fetch(`${this.host}${path}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-AllStak-Key': this.apiKey,
+        },
+        body,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
     }
   }
 }

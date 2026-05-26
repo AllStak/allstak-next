@@ -12,6 +12,7 @@ export {
   setClient,
   parseStack,
   formatFrames,
+  parseRetryAfter,
   type AllStakNextClientOptions,
   type Breadcrumb,
   type BreadcrumbType,
