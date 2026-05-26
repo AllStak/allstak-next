@@ -1,5 +1,6 @@
 import { resolveDebugId } from './utils/debug-id';
 import { scrub } from './sanitize';
+import { getActiveMergedScope, type MergedScopeData } from './scope';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
@@ -193,6 +194,38 @@ export class AllStakNextClient {
     }
   }
 
+  /**
+   * Merge the active scope (per-request when inside a wrapped handler, else the
+   * global scope) onto an error/message event the client just built:
+   *   - scope user/tags/extras/contexts → metadata (user.* / tag.* / extra.* / context.*)
+   *   - scope breadcrumbs prepended ahead of the client's own ring buffer
+   *   - scope level overrides the default when set
+   * Mutates and returns the payload. Pure w.r.t. the scope objects.
+   */
+  private mergeScope(payload: ErrorPayload, merged: MergedScopeData = getActiveMergedScope()): ErrorPayload {
+    if (merged.user) {
+      payload.metadata.user = { ...(payload.metadata.user as object | undefined ?? {}), ...merged.user };
+    }
+    for (const [k, v] of Object.entries(merged.tags)) payload.metadata[`tag.${k}`] = v;
+    for (const [k, v] of Object.entries(merged.extras)) payload.metadata[`extra.${k}`] = v;
+    for (const [name, ctx] of Object.entries(merged.contexts)) payload.metadata[`context.${name}`] = ctx;
+    if (merged.fingerprint) payload.metadata.fingerprint = merged.fingerprint;
+    if (merged.level) payload.level = merged.level;
+    if (merged.breadcrumbs.length) {
+      payload.breadcrumbs = [
+        ...merged.breadcrumbs.map((c) => ({
+          timestamp: c.timestamp ?? new Date().toISOString(),
+          type: (c.type as Breadcrumb['type']) ?? 'custom',
+          message: c.message,
+          level: c.level,
+          data: c.data,
+        })),
+        ...payload.breadcrumbs,
+      ];
+    }
+    return payload;
+  }
+
   addBreadcrumb(breadcrumb: Omit<Breadcrumb, 'timestamp'>): void {
     if (this.destroyed) return;
     this.breadcrumbs.push({ ...breadcrumb, timestamp: new Date().toISOString() });
@@ -236,6 +269,7 @@ export class AllStakNextClient {
       platform: 'node',
       debugMeta,
     };
+    this.mergeScope(payload);
     const outbound = this.applyEventPipeline(payload);
     if (!outbound) return;
     await this.send('/ingest/v1/errors', outbound);
@@ -258,6 +292,7 @@ export class AllStakNextClient {
       sdkVersion: SDK_VERSION,
       platform: 'node',
     };
+    this.mergeScope(payload);
     const outbound = this.applyEventPipeline(payload);
     if (!outbound) return;
     await this.send('/ingest/v1/errors', outbound);

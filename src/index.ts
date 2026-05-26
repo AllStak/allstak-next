@@ -6,6 +6,14 @@ import { randomUUID } from 'node:crypto';
 // Restores the public API that shipped on @allstak/next@0.1.0; the
 // short-circuit publish of 0.1.1 missed these because index.ts didn't
 // re-export from the freshly-tracked source files.
+import { AllStakNextClient, getClient, setClient, type SeverityLevel } from './client';
+import {
+  Scope,
+  scopeManager,
+  type ScopeUser,
+  type ScopeBreadcrumb,
+} from './scope';
+
 export {
   AllStakNextClient,
   getClient,
@@ -23,6 +31,8 @@ export {
   type StackFrame,
   type DebugImage,
 } from './client';
+export { Scope } from './scope';
+export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
 export { resolveDebugId, _resetDebugIdCache } from './utils/debug-id';
 export { AllStakErrorBoundary, withAllStakErrorBoundary, type AllStakErrorBoundaryProps } from './error-boundary';
 export { registerAllStak, type RegisterAllStakOptions } from './instrumentation';
@@ -63,27 +73,98 @@ export function initAllStakNext(config: AllStakNextConfig): void {
     ...config,
     host: (config.host || DEFAULT_HOST).replace(/\/$/, ''),
   };
+  // Register a real client so the module-level captureException/captureMessage
+  // and scope API route through the full pipeline (frame parsing, breadcrumbs,
+  // sampling, beforeSend, redaction) instead of the old raw-fetch shadow.
+  // Skip if a client was already registered (e.g. via registerAllStak).
+  const existing = getClient();
+  if ((!existing || existing.isDestroyed()) && config.apiKey) {
+    setClient(new AllStakNextClient({
+      apiKey: config.apiKey,
+      host: config.host,
+      environment: config.environment,
+      release: config.release,
+    }));
+  }
 }
 
+/**
+ * Capture an exception on demand.
+ *
+ * Routes through the registered {@link AllStakNextClient} (set via
+ * `registerAllStak`) so the capture runs through the full pipeline — stack
+ * frame parsing + debug-IDs, breadcrumbs, sampling, beforeSend, and wire
+ * redaction — and merges the active scope (user/tags/extras/contexts set via
+ * the scope API below). The previous degraded top-level raw-fetch shadow has
+ * been removed.
+ *
+ * If `registerAllStak` was not called, this is a safe no-op (telemetry must
+ * never crash the host app).
+ */
 export async function captureException(error: Error, context: Record<string, unknown> = {}): Promise<void> {
-  const config = (globalThis as typeof globalThis & { __ALLSTAK_NEXT__?: AllStakNextConfig }).__ALLSTAK_NEXT__;
-  if (!config?.apiKey) return;
-  await fetch(`${(config.host || DEFAULT_HOST).replace(/\/$/, '')}/ingest/v1/errors`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-AllStak-Key': config.apiKey,
-    },
-    body: JSON.stringify({
-      exceptionClass: error.name || 'Error',
-      message: error.message,
-      stackTrace: error.stack ? error.stack.split('\n') : [],
-      level: 'error',
-      environment: config.environment || '',
-      release: config.release || '',
-      metadata: { sdkName: '@allstak/next', ...context },
-    }),
-  });
+  const client = getClient();
+  if (!client || client.isDestroyed()) return;
+  await client.captureException(error, context);
+}
+
+/**
+ * Capture a freeform message on demand through the registered client (parity
+ * with @sentry/node `captureMessage`). Safe no-op if no client is registered.
+ */
+export async function captureMessage(message: string, level: SeverityLevel = 'info'): Promise<void> {
+  const client = getClient();
+  if (!client || client.isDestroyed()) return;
+  await client.captureMessage(message, level);
+}
+
+// ── Module-level scope API ──────────────────────────────────────────────────
+// Mutates the active scope (per-request when inside a wrapped route handler /
+// server action, else the process-global scope). Values attach to events
+// captured afterwards.
+
+/** Set the user on the active (request or global) scope. */
+export function setUser(user: ScopeUser | null): void {
+  scopeManager.getCurrentScope().setUser(user);
+}
+/** Set a single tag on the active scope. */
+export function setTag(key: string, value: string): void {
+  scopeManager.getCurrentScope().setTag(key, value);
+}
+/** Merge tags onto the active scope. */
+export function setTags(tags: Record<string, string>): void {
+  scopeManager.getCurrentScope().setTags(tags);
+}
+/** Set a single extra value on the active scope. */
+export function setExtra(key: string, value: unknown): void {
+  scopeManager.getCurrentScope().setExtra(key, value);
+}
+/** Merge extras onto the active scope. */
+export function setExtras(extras: Record<string, unknown>): void {
+  scopeManager.getCurrentScope().setExtras(extras);
+}
+/** Attach (or remove, with `null`) a named context bag on the active scope. */
+export function setContext(name: string, ctx: Record<string, unknown> | null): void {
+  scopeManager.getCurrentScope().setContext(name, ctx);
+}
+/** Add a breadcrumb to the active scope; attached to subsequently captured events. */
+export function addBreadcrumb(crumb: ScopeBreadcrumb): void {
+  scopeManager.getCurrentScope().addBreadcrumb(crumb);
+}
+/** Run `callback` with a forked scope that is popped afterwards (sync or async). */
+export function withScope<T>(callback: (scope: Scope) => T): T {
+  return scopeManager.withScope(callback);
+}
+/** Mutate the active scope in place. */
+export function configureScope(callback: (scope: Scope) => void): void {
+  scopeManager.configureScope(callback);
+}
+/**
+ * Run `work` inside a fresh request-isolated scope (AsyncLocalStorage). Used by
+ * the route-handler / server-action wrappers so per-request user/tags don't
+ * leak across concurrent requests. Exposed for advanced manual wiring.
+ */
+export function runWithRequestScope<T>(work: () => T): T {
+  return scopeManager.runInRequestScope(work);
 }
 
 export async function processNextSourceMaps(options: SourceMapUploadOptions): Promise<{ pairs: number; uploaded: number }> {

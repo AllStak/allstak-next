@@ -1,4 +1,5 @@
 import { getClient, type SpanPayload } from './client';
+import { scopeManager } from './scope';
 
 type RouteRequest = {
   headers?: Headers;
@@ -40,7 +41,10 @@ export function withAllStakRouteHandler<
   TContext,
   TResponse extends RouteResponse,
 >(handler: RouteHandler<TRequest, TContext, TResponse>): RouteHandler<TRequest, TContext, TResponse> {
-  return async (request: TRequest, context?: TContext): Promise<TResponse> => {
+  // Run the entire handler inside a fresh request-isolated scope so user/tags
+  // set via setUser/setTag inside the handler attach to errors captured for
+  // THIS request and don't leak across concurrent requests.
+  return async (request: TRequest, context?: TContext): Promise<TResponse> => scopeManager.runInRequestScope(async () => {
     const telemetry = createRouteTelemetryContext(request);
 
     try {
@@ -65,14 +69,14 @@ export function withAllStakRouteHandler<
       await captureRouteTelemetry(telemetry, 500, endTimeMillis, 'error');
       throw error;
     }
-  };
+  });
 }
 
 export function withAllStakServerAction<TArgs extends unknown[], TResult>(
   action: ServerAction<TArgs, TResult>,
   options: ServerActionTelemetryOptions = {},
 ): ServerAction<TArgs, TResult> {
-  return async (...args: TArgs): Promise<TResult> => {
+  return async (...args: TArgs): Promise<TResult> => scopeManager.runInRequestScope(async () => {
     const traceId = generateTraceId();
     const spanId = generateSpanId();
     const startTimeMillis = Date.now();
@@ -115,7 +119,7 @@ export function withAllStakServerAction<TArgs extends unknown[], TResult>(
       });
       throw error;
     }
-  };
+  });
 }
 
 export function createRouteTelemetryContext(request: RouteRequest): RouteTelemetryContext {
