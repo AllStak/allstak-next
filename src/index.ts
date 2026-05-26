@@ -119,8 +119,8 @@ export async function captureException(error: Error, context: Record<string, unk
 }
 
 /**
- * Capture a freeform message on demand through the registered client (parity
- * with @sentry/node `captureMessage`). Safe no-op if no client is registered.
+ * Capture a freeform message on demand through the registered client.
+ * Safe no-op if no client is registered.
  */
 export async function captureMessage(message: string, level: SeverityLevel = 'info'): Promise<void> {
   const client = getClient();
