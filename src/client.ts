@@ -118,6 +118,12 @@ export interface HttpRequestPayload {
   timestamp: string;
 }
 
+/**
+ * Outbound error/message event passed to `beforeSend`. This is the
+ * fully-built wire payload (before redaction). Returning `null` drops it.
+ */
+export type AllStakNextEvent = ErrorPayload;
+
 export interface AllStakNextClientOptions {
   apiKey?: string;
   dsn?: string;
@@ -125,6 +131,28 @@ export interface AllStakNextClientOptions {
   endpoint?: string;
   environment?: string;
   release?: string;
+  /**
+   * Fraction 0..1 of error/message events captured. Default 1 (keep all).
+   * Applied at capture time, BEFORE `beforeSend`: dropped events never reach
+   * `beforeSend`. Out-of-range or non-finite values clamp to [0, 1].
+   */
+  sampleRate?: number;
+  /**
+   * Called once just before an error/message event is sent. Return the event
+   * (optionally mutated) to send it, or `null` to drop it. Fail-open: if the
+   * callback throws, the original event is sent. Not called for events already
+   * dropped by `sampleRate`.
+   */
+  beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
+  /** RNG seam for deterministic tests. Defaults to Math.random. Returns [0,1). */
+  random?: () => number;
+}
+
+function clamp01(n: number | undefined): number {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return 1;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
 }
 
 export class AllStakNextClient {
@@ -132,6 +160,9 @@ export class AllStakNextClient {
   private readonly host: string;
   private readonly environment: string;
   private readonly release: string;
+  private readonly sampleRate: number;
+  private readonly beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
+  private readonly random: () => number;
   private breadcrumbs: Breadcrumb[] = [];
   private destroyed = false;
   private pendingRequests: Promise<void>[] = [];
@@ -141,6 +172,25 @@ export class AllStakNextClient {
     this.host = (options.host || options.endpoint || DEFAULT_HOST).replace(/\/$/, '');
     this.environment = options.environment || '';
     this.release = options.release || '';
+    this.sampleRate = clamp01(options.sampleRate);
+    this.beforeSend = options.beforeSend;
+    this.random = options.random || Math.random;
+  }
+
+  /**
+   * Capture-time event pipeline for error/message events:
+   *   sampleRate drop → beforeSend → (transport applies redaction).
+   * Returns the event to send, or `null` if it was dropped. `beforeSend` is
+   * fail-open: a throwing callback yields the original event.
+   */
+  private applyEventPipeline(event: AllStakNextEvent): AllStakNextEvent | null {
+    if (this.sampleRate < 1 && this.random() >= this.sampleRate) return null;
+    if (!this.beforeSend) return event;
+    try {
+      return this.beforeSend(event) ?? null;
+    } catch {
+      return event; // beforeSend errors must never crash capture
+    }
   }
 
   addBreadcrumb(breadcrumb: Omit<Breadcrumb, 'timestamp'>): void {
@@ -186,7 +236,9 @@ export class AllStakNextClient {
       platform: 'node',
       debugMeta,
     };
-    await this.send('/ingest/v1/errors', payload);
+    const outbound = this.applyEventPipeline(payload);
+    if (!outbound) return;
+    await this.send('/ingest/v1/errors', outbound);
   }
 
   async captureMessage(message: string, level: SeverityLevel = 'info'): Promise<void> {
@@ -206,7 +258,9 @@ export class AllStakNextClient {
       sdkVersion: SDK_VERSION,
       platform: 'node',
     };
-    await this.send('/ingest/v1/errors', payload);
+    const outbound = this.applyEventPipeline(payload);
+    if (!outbound) return;
+    await this.send('/ingest/v1/errors', outbound);
   }
 
   async captureSpan(span: SpanPayload): Promise<void> {

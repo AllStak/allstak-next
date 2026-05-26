@@ -14,6 +14,7 @@ export {
   formatFrames,
   parseRetryAfter,
   type AllStakNextClientOptions,
+  type AllStakNextEvent,
   type Breadcrumb,
   type BreadcrumbType,
   type BreadcrumbCategory,
