@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   resolveRelease,
   resolveGitRelease,
@@ -7,10 +7,12 @@ import {
   _resetReleaseCache,
   type GitRunner,
 } from '../src/release';
-import { AllStakNextClient, SDK_VERSION } from '../src/client';
+import { AllStakNextClient, SDK_VERSION, _resetRuntimeReleaseRegistrationForTest } from '../src/client';
 
 afterEach(() => {
   _resetReleaseCache();
+  _resetRuntimeReleaseRegistrationForTest();
+  vi.restoreAllMocks();
 });
 
 /** Build a fake git runner from a map of "joined args" → output (or throw). */
@@ -191,5 +193,35 @@ describe('AllStakNextClient integration', () => {
         !process.env.RENDER_GIT_COMMIT && !process.env.SOURCE_VERSION) {
       expect(c.getRelease()).toBe('');
     }
+  });
+
+  it('registers the resolved release once without a CI/CD hook', async () => {
+    const fetchSpy = vi.fn(async () => ({ ok: true, status: 200, headers: { get: () => null } })) as any;
+    vi.stubGlobal('fetch', fetchSpy);
+
+    new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.example.test',
+      environment: 'production',
+      release: 'next@1.2.3',
+      autoRegisterRelease: true,
+    });
+    new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.example.test',
+      environment: 'production',
+      release: 'next@1.2.3',
+      autoRegisterRelease: true,
+    });
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    expect(fetchSpy).toHaveBeenCalledWith(
+      'https://api.example.test/ingest/v1/releases',
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ 'X-AllStak-Key': 'ask_test' }),
+        body: expect.stringContaining('"version":"next@1.2.3"'),
+      }),
+    );
   });
 });

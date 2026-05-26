@@ -10,6 +10,7 @@ const TRANSPORT_TIMEOUT_MS = 3000;
 const MAX_BREADCRUMBS = 30;
 /** Upper bound for any honored Retry-After delay. */
 const MAX_RETRY_AFTER_MS = 300_000;
+const runtimeReleaseRegistrations = new Set<string>();
 
 /**
  * Parse an HTTP `Retry-After` header into a delay in milliseconds.
@@ -156,6 +157,12 @@ export interface AllStakNextClientOptions {
    * Next.js edge or browser runtimes — there it resolves from env/version only.
    */
   autoDetectRelease?: boolean;
+  /**
+   * Register the resolved release with AllStak from the server runtime at
+   * startup, without requiring a CI/CD hook. Default true. Browser/edge
+   * runtimes are skipped.
+   */
+  autoRegisterRelease?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
 }
@@ -195,6 +202,23 @@ export class AllStakNextClient {
     this.sampleRate = clamp01(options.sampleRate);
     this.beforeSend = options.beforeSend;
     this.random = options.random || Math.random;
+    if (shouldAutoRegisterRelease(options.autoRegisterRelease)) {
+      this.registerRuntimeRelease();
+    }
+  }
+
+  private registerRuntimeRelease(): void {
+    if (!this.apiKey || !this.release || !isNodeServer()) return;
+    const environment = this.environment || 'production';
+    const key = `${this.host}|${this.apiKey}|${environment}|${this.release}`;
+    if (runtimeReleaseRegistrations.has(key)) return;
+    runtimeReleaseRegistrations.add(key);
+    void this.postOnce('/ingest/v1/releases', JSON.stringify({
+      version: this.release,
+      environment,
+      author: `${SDK_NAME}/${SDK_VERSION}`,
+      message: 'Registered automatically by AllStak Next SDK at runtime',
+    })).catch(() => undefined);
   }
 
   /**
@@ -450,4 +474,21 @@ export function getClient(): AllStakNextClient | null {
 
 export function setClient(client: AllStakNextClient | null): void {
   clientSingleton = client;
+}
+
+function isNodeServer(): boolean {
+  const proc = (globalThis as { process?: { versions?: { node?: string }; env?: Record<string, string | undefined> } }).process;
+  return !!proc?.versions?.node && proc.env?.NEXT_RUNTIME !== 'edge';
+}
+
+function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+}
+
+/** @internal */
+export function _resetRuntimeReleaseRegistrationForTest(): void {
+  runtimeReleaseRegistrations.clear();
 }

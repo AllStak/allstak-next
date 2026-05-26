@@ -30,6 +30,7 @@ export {
   type SeverityLevel,
   type StackFrame,
   type DebugImage,
+  _resetRuntimeReleaseRegistrationForTest,
 } from './client';
 export { Scope } from './scope';
 export type { ScopeUser, ScopeBreadcrumb, Severity, MergedScopeData } from './scope';
