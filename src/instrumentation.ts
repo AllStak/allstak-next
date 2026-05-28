@@ -53,7 +53,44 @@ export function registerAllStak(options: RegisterAllStakOptions): AllStakNextCli
         }
       });
     }
+
+    // Release-health: end the session on graceful shutdown. Best-effort and
+    // fully fail-open — `endSession` is idempotent so multiple signals are safe.
+    // Only wired when auto session tracking actually started a session (also
+    // suppressed under the unit-test runtime, so tests don't register signals).
+    if (client.isSessionTrackingEnabled()) {
+      installSessionShutdownHooks(client);
+    }
   }
 
   return client;
+}
+
+/**
+ * Hook process-exit signals so the release-health session is ended (POST
+ * `/ingest/v1/sessions/end`) on a graceful shutdown. `endSession` is idempotent
+ * and best-effort: signal handlers re-raise the default behaviour after a
+ * fire-and-forget end so they don't change the host process's exit semantics.
+ */
+function installSessionShutdownHooks(client: AllStakNextClient): void {
+  const end = () => {
+    try {
+      client.endSession();
+    } catch {
+      // fail-open
+    }
+  };
+  // `beforeExit`/`exit` cover normal teardown; the signals cover container/
+  // orchestrator stops. We do NOT call process.exit ourselves.
+  process.on('beforeExit', end);
+  process.on('exit', end);
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    try {
+      process.on(signal, () => {
+        end();
+      });
+    } catch {
+      // some runtimes disallow custom signal handlers — ignore
+    }
+  }
 }

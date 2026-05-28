@@ -7,6 +7,8 @@ const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
 export const SDK_VERSION = '0.1.3';
 const TRANSPORT_TIMEOUT_MS = 3000;
+/** Shorter timeout for the session/end POST so graceful shutdown is never blocked. */
+const SESSION_END_TIMEOUT_MS = 1500;
 const MAX_BREADCRUMBS = 30;
 /** Upper bound for any honored Retry-After delay. */
 const MAX_RETRY_AFTER_MS = 300_000;
@@ -50,6 +52,16 @@ export type BreadcrumbType = 'navigation' | 'ui' | 'http' | 'console' | 'custom'
 export type BreadcrumbCategory = BreadcrumbType;
 export type SeverityLevel = 'fatal' | 'error' | 'warning' | 'info' | 'debug';
 
+/**
+ * Release-health session status. Mirrors the Java SDK's `SessionStatus` and the
+ * backend `/ingest/v1/sessions/end` contract:
+ *   - `ok`       — session running / ended normally.
+ *   - `errored`  — at least one HANDLED error captured, process kept running.
+ *   - `crashed`  — an UNHANDLED / fatal error ended the session.
+ *   - `abnormal` — ended without a normal flush (reserved).
+ */
+export type SessionStatus = 'ok' | 'errored' | 'crashed' | 'abnormal';
+
 export interface Breadcrumb {
   timestamp: string;
   type: BreadcrumbType;
@@ -86,6 +98,8 @@ export interface ErrorPayload {
   sdkName: string;
   sdkVersion: string;
   platform: string;
+  /** Release-health session id; lets the backend attribute the error to the active session. */
+  sessionId?: string;
   debugMeta?: { images: DebugImage[] };
 }
 
@@ -163,6 +177,15 @@ export interface AllStakNextClientOptions {
    * runtimes are skipped.
    */
   autoRegisterRelease?: boolean;
+  /**
+   * Enable release-health session tracking (Sentry-style "one session per
+   * process / app-launch"). When true (the default), the client POSTs
+   * `/ingest/v1/sessions/start` at init and `/ingest/v1/sessions/end` on
+   * graceful shutdown, tracking a local ok/errored/crashed status in between.
+   * Sessions are NEVER sampled. Fully fail-open. Set false to opt out.
+   * Automatically skipped under a unit-test runtime (NODE_ENV=test / VITEST).
+   */
+  enableAutoSessionTracking?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
 }
@@ -186,6 +209,15 @@ export class AllStakNextClient {
   private destroyed = false;
   private pendingRequests: Promise<void>[] = [];
 
+  // ── Release-health session state (one session per process / app-launch) ──
+  private readonly platform: string;
+  private readonly sessionTrackingEnabled: boolean;
+  private readonly sessionId: string;
+  private sessionStart = 0;
+  private sessionStatus: SessionStatus = 'ok';
+  private sessionStarted = false;
+  private sessionEnded = false;
+
   constructor(options: AllStakNextClientOptions) {
     this.apiKey = options.apiKey || options.dsn || '';
     this.host = (options.host || options.endpoint || DEFAULT_HOST).replace(/\/$/, '');
@@ -202,9 +234,94 @@ export class AllStakNextClient {
     this.sampleRate = clamp01(options.sampleRate);
     this.beforeSend = options.beforeSend;
     this.random = options.random || Math.random;
+    this.platform = detectPlatform();
+    this.sessionId = generateSessionId();
+    this.sessionTrackingEnabled = shouldAutoSessionTrack(options.enableAutoSessionTracking);
     if (shouldAutoRegisterRelease(options.autoRegisterRelease)) {
       this.registerRuntimeRelease();
     }
+    if (this.sessionTrackingEnabled) {
+      this.startSession();
+    }
+  }
+
+  /** Stable id for the current release-health session. */
+  getSessionId(): string {
+    return this.sessionId;
+  }
+
+  /** Whether release-health session tracking is active for this client. */
+  isSessionTrackingEnabled(): boolean {
+    return this.sessionTrackingEnabled;
+  }
+
+  /** Current in-memory session status (ok → errored → crashed). */
+  getSessionStatus(): SessionStatus {
+    return this.sessionStatus;
+  }
+
+  /**
+   * Begin the release-health session: record the start time, mark status `ok`,
+   * and POST `/ingest/v1/sessions/start`. Idempotent and fully fail-open — a
+   * missing apiKey, a disabled client, or a network error never throws or
+   * blocks init. Sessions are NEVER sampled. Fired through the existing
+   * transport path; the POST is not awaited so init stays non-blocking.
+   */
+  startSession(): void {
+    if (this.sessionStarted || this.destroyed) return;
+    this.sessionStarted = true;
+    this.sessionStart = Date.now();
+    this.sessionStatus = 'ok';
+    if (!this.apiKey) return;
+    const scopeUser = getActiveMergedScope().user;
+    const userId = typeof scopeUser?.id === 'string' ? scopeUser.id : undefined;
+    const payload: Record<string, unknown> = {
+      sessionId: this.sessionId,
+      // Release-health needs a non-empty release; fall back to the SDK version.
+      release: this.release || SDK_VERSION,
+      environment: this.environment,
+      userId,
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
+      platform: this.platform,
+    };
+    // Bypass the sampling pipeline (sessions are never sampled) and don't await:
+    // init must not block on a network round-trip.
+    void this.send('/ingest/v1/sessions/start', payload).catch(() => undefined);
+  }
+
+  /**
+   * Record a HANDLED error against the active session: bump status to
+   * `errored` unless it has already escalated to a terminal `crashed`. No I/O —
+   * the status rides the session/end POST. Mirrors the Java `Session.recordError`.
+   */
+  markSessionErrored(): void {
+    if (this.sessionStatus === 'ok') this.sessionStatus = 'errored';
+  }
+
+  /**
+   * Record an UNHANDLED / fatal crash against the active session (overrides
+   * `errored`). No I/O — the status rides the session/end POST. Mirrors the
+   * Java `Session.recordCrash`.
+   */
+  markSessionCrashed(): void {
+    this.sessionStatus = 'crashed';
+  }
+
+  /**
+   * Terminate the release-health session on graceful shutdown: compute
+   * `durationMs` and POST `/ingest/v1/sessions/end` with the final status.
+   * Idempotent, best-effort, short timeout — must never block or throw. The
+   * server does NOT downgrade an already-crashed session.
+   */
+  endSession(finalStatus?: SessionStatus): void {
+    if (this.sessionEnded || !this.sessionStarted) return;
+    this.sessionEnded = true;
+    if (!this.apiKey) return;
+    const status = finalStatus ?? this.sessionStatus;
+    const durationMs = Math.max(0, Date.now() - this.sessionStart);
+    const payload = { sessionId: this.sessionId, durationMs, status };
+    void this.send('/ingest/v1/sessions/end', payload, SESSION_END_TIMEOUT_MS).catch(() => undefined);
   }
 
   private registerRuntimeRelease(): void {
@@ -309,10 +426,15 @@ export class AllStakNextClient {
       timestamp: new Date().toISOString(),
       sdkName: SDK_NAME,
       sdkVersion: SDK_VERSION,
-      platform: 'node',
+      platform: this.platform,
+      sessionId: this.sessionId,
       debugMeta,
     };
     this.mergeScope(payload);
+    // Release-health status: an unhandled/fatal mechanism crashes the session,
+    // anything else captured here is a handled error.
+    if (isCrashMechanism(context, payload.level)) this.markSessionCrashed();
+    else this.markSessionErrored();
     const outbound = this.applyEventPipeline(payload);
     if (!outbound) return;
     await this.send('/ingest/v1/errors', outbound);
@@ -333,9 +455,14 @@ export class AllStakNextClient {
       timestamp: new Date().toISOString(),
       sdkName: SDK_NAME,
       sdkVersion: SDK_VERSION,
-      platform: 'node',
+      platform: this.platform,
+      sessionId: this.sessionId,
     };
     this.mergeScope(payload);
+    // A fatal-level message escalates the session to crashed; error-level
+    // marks it errored. info/warning/debug leave the session ok.
+    if (level === 'fatal') this.markSessionCrashed();
+    else if (level === 'error') this.markSessionErrored();
     const outbound = this.applyEventPipeline(payload);
     if (!outbound) return;
     await this.send('/ingest/v1/errors', outbound);
@@ -363,6 +490,14 @@ export class AllStakNextClient {
   }
 
   destroy(): void {
+    // Graceful dispose path: end the session (best-effort) before tearing down.
+    if (this.sessionTrackingEnabled) {
+      try {
+        this.endSession();
+      } catch {
+        // fail-open
+      }
+    }
     this.destroyed = true;
     this.breadcrumbs = [];
     this.pendingRequests = [];
@@ -384,25 +519,38 @@ export class AllStakNextClient {
     return this.release;
   }
 
-  private async send(path: string, payload: unknown): Promise<void> {
-    const request = this.doFetch(path, payload);
+  private async send(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
+    const request = this.doFetch(path, payload, timeoutMs);
     this.pendingRequests.push(request);
     await request;
   }
 
-  private async doFetch(path: string, payload: unknown): Promise<void> {
+  private async doFetch(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
     try {
       // Scrub the full wire payload before serialization. One chokepoint
       // protects every telemetry type. Pure (no caller mutation),
       // fail-open on sanitizer error.
       let body: string;
       try {
-        body = JSON.stringify(scrub(payload));
+        const scrubbed = scrub(payload) as unknown;
+        // The sanitizer denylist substring-matches `session`, which would
+        // redact the SDK-generated release-health `sessionId` (a non-PII
+        // correlation id the backend NEEDS to attribute errors to a session).
+        // Restore only our own top-level id; user-supplied nested
+        // session/cookie/token keys stay redacted.
+        if (
+          scrubbed && typeof scrubbed === 'object' &&
+          payload && typeof payload === 'object' &&
+          typeof (payload as { sessionId?: unknown }).sessionId === 'string'
+        ) {
+          (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId: string }).sessionId;
+        }
+        body = JSON.stringify(scrubbed);
       } catch {
         body = JSON.stringify(payload);
       }
 
-      const response = await this.postOnce(path, body);
+      const response = await this.postOnce(path, body, timeoutMs);
       // Honor a server-provided Retry-After on 429/503: wait the indicated
       // delay (capped at MAX_RETRY_AFTER_MS) and retry exactly once. Any
       // other status — including 429/503 without a usable header — keeps the
@@ -412,7 +560,7 @@ export class AllStakNextClient {
         const waitMs = parseRetryAfter(headerValue, Date.now());
         if (waitMs > 0) {
           await new Promise((r) => setTimeout(r, waitMs));
-          await this.postOnce(path, body);
+          await this.postOnce(path, body, timeoutMs);
         }
       }
     } catch {
@@ -420,9 +568,9 @@ export class AllStakNextClient {
     }
   }
 
-  private async postOnce(path: string, body: string): Promise<Response | undefined> {
+  private async postOnce(path: string, body: string, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<Response | undefined> {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), TRANSPORT_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await fetch(`${this.host}${path}`, {
         method: 'POST',
@@ -486,6 +634,60 @@ function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
   if (value === true) return true;
   const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
   return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+}
+
+/**
+ * Decide whether release-health session tracking is active. Defaults to TRUE,
+ * but is automatically suppressed under a unit-test runtime (NODE_ENV=test /
+ * VITEST) so the SDK's own tests don't emit session start/end traffic — mirrors
+ * the Java SDK's test guard and the existing `shouldAutoRegisterRelease`.
+ * An explicit `true`/`false` always wins (tests opt in by passing `true`).
+ */
+function shouldAutoSessionTrack(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+}
+
+/**
+ * Best-effort platform label for the active Next.js runtime. The original
+ * client hardcoded `node` everywhere; sessions and events should report the
+ * runtime they actually ran on: `browser`, `edge`, or `node`.
+ */
+function detectPlatform(): string {
+  const proc = (globalThis as {
+    process?: { versions?: { node?: string }; env?: Record<string, string | undefined> };
+  }).process;
+  if (proc?.env?.NEXT_RUNTIME === 'edge') return 'edge';
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') return 'browser';
+  if (proc?.versions?.node) return 'node';
+  // Edge runtime defines a minimal `process` shim without `versions.node`.
+  return proc ? 'edge' : 'browser';
+}
+
+/** Runtime-safe session id (uses crypto.randomUUID when available). */
+function generateSessionId(): string {
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  if (c?.randomUUID) return c.randomUUID();
+  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+}
+
+/**
+ * A captured exception is a session "crash" (vs. a handled "errored") when it
+ * arrived through an unhandled/global mechanism or carries a fatal level.
+ * Mirrors the Java SDK split between `recordError` and `recordCrash`.
+ */
+const CRASH_MECHANISMS = new Set([
+  'uncaughtException',
+  'unhandledRejection',
+  'window.onerror',
+  'window.onunhandledrejection',
+]);
+function isCrashMechanism(context: Record<string, unknown>, level: SeverityLevel): boolean {
+  if (level === 'fatal') return true;
+  const mechanism = context?.mechanism;
+  return typeof mechanism === 'string' && CRASH_MECHANISMS.has(mechanism);
 }
 
 /** @internal */

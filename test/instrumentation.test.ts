@@ -77,4 +77,41 @@ describe('registerAllStak', () => {
       );
     }
   });
+
+  describe('release-health session shutdown hooks', () => {
+    const installed: string[] = [];
+    let beforeExitHandler: (() => void) | undefined;
+
+    beforeEach(() => {
+      installed.length = 0;
+      beforeExitHandler = undefined;
+      vi.spyOn(process, 'on').mockImplementation(((event: string, handler: (...args: any[]) => void) => {
+        installed.push(event);
+        if (event === 'beforeExit') beforeExitHandler = handler as () => void;
+        return process;
+      }) as typeof process.on);
+    });
+
+    it('registers graceful-shutdown hooks when session tracking is enabled', () => {
+      registerAllStak({ apiKey: 'ask_test', release: '1.0.0', enableAutoSessionTracking: true });
+      expect(installed).toContain('beforeExit');
+      expect(installed).toContain('exit');
+      expect(installed).toContain('SIGTERM');
+      expect(installed).toContain('SIGINT');
+    });
+
+    it('does NOT register shutdown hooks when session tracking is disabled', () => {
+      registerAllStak({ apiKey: 'ask_test', release: '1.0.0', enableAutoSessionTracking: false });
+      expect(installed).not.toContain('beforeExit');
+      expect(installed).not.toContain('SIGTERM');
+    });
+
+    it('ends the session when a shutdown signal fires', () => {
+      const client = registerAllStak({ apiKey: 'ask_test', release: '1.0.0', enableAutoSessionTracking: true });
+      const endSpy = vi.spyOn(client, 'endSession');
+      expect(beforeExitHandler).toBeTypeOf('function');
+      beforeExitHandler!();
+      expect(endSpy).toHaveBeenCalled();
+    });
+  });
 });

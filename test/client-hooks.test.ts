@@ -100,3 +100,47 @@ describe('installGlobalErrorHandlers', () => {
     );
   });
 });
+
+describe('installGlobalErrorHandlers — session end on pagehide', () => {
+  const listeners: Record<string, Array<(...args: any[]) => void>> = {};
+
+  beforeEach(() => {
+    for (const key of Object.keys(listeners)) delete listeners[key];
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true }));
+    vi.stubGlobal('window', {
+      onerror: null as any,
+      onunhandledrejection: null as any,
+      addEventListener: (event: string, handler: (...args: any[]) => void) => {
+        (listeners[event] ??= []).push(handler);
+      },
+      removeEventListener: (event: string, handler: (...args: any[]) => void) => {
+        listeners[event] = (listeners[event] ?? []).filter((h) => h !== handler);
+      },
+    });
+  });
+
+  afterEach(() => {
+    setClient(null);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('ends the session when the page is hidden (pagehide)', () => {
+    const client = new AllStakNextClient({
+      apiKey: 'ask_test',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+    });
+    const endSpy = vi.spyOn(client, 'endSession');
+    setClient(client);
+
+    const teardown = installGlobalErrorHandlers();
+    expect(listeners['pagehide']).toBeTruthy();
+
+    listeners['pagehide'][0]();
+    expect(endSpy).toHaveBeenCalled();
+
+    teardown();
+    expect(listeners['pagehide']).toHaveLength(0);
+  });
+});

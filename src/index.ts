@@ -28,6 +28,7 @@ export {
   type BreadcrumbCategory,
   type ErrorPayload,
   type SeverityLevel,
+  type SessionStatus,
   type StackFrame,
   type DebugImage,
   _resetRuntimeReleaseRegistrationForTest,
@@ -69,6 +70,11 @@ export interface AllStakNextConfig {
   uploadToken?: string;
   dist?: string;
   tunnelRoute?: string;
+  /**
+   * Enable release-health session tracking (start on init, end on graceful
+   * shutdown, ok/errored/crashed status). Default true. Set false to opt out.
+   */
+  enableAutoSessionTracking?: boolean;
 }
 
 export interface SourceMapUploadOptions {
@@ -96,6 +102,7 @@ export function initAllStakNext(config: AllStakNextConfig): void {
       host: config.host,
       environment: config.environment,
       release: config.release,
+      enableAutoSessionTracking: config.enableAutoSessionTracking,
     }));
   }
 }

@@ -70,9 +70,45 @@ export function installGlobalErrorHandlers(): () => void {
     }
   };
 
+  const removeSessionHooks = installSessionEndHook();
+
   // Return a teardown function
   return () => {
     window.onerror = prevOnError;
     window.onunhandledrejection = prevOnUnhandledRejection;
+    removeSessionHooks();
+  };
+}
+
+/**
+ * End the release-health session when the page is going away. `pagehide` is the
+ * reliable browser signal for app-launch teardown (it fires on bfcache, tab
+ * close, and navigation away where `unload` is unreliable). `endSession` is
+ * idempotent and best-effort, so firing on both `pagehide` and a `hidden`
+ * visibility change is safe. Returns a teardown that removes the listeners.
+ */
+function installSessionEndHook(): () => void {
+  if (typeof window === 'undefined' || typeof window.addEventListener !== 'function') {
+    return () => {};
+  }
+  const end = () => {
+    try {
+      getClient()?.endSession();
+    } catch {
+      // fail-open
+    }
+  };
+  const onVisibility = () => {
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') end();
+  };
+  window.addEventListener('pagehide', end);
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', onVisibility);
+  }
+  return () => {
+    window.removeEventListener('pagehide', end);
+    if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+      document.removeEventListener('visibilitychange', onVisibility);
+    }
   };
 }
