@@ -81,9 +81,11 @@ export function installGlobalErrorHandlers(): () => void {
 }
 
 /**
- * End the release-health session when the page is going away. `pagehide` is the
- * reliable browser signal for app-launch teardown (it fires on bfcache, tab
- * close, and navigation away where `unload` is unreliable). `endSession` is
+ * End the release-health session when the page is going away, and flush any
+ * persisted (failed/buffered) telemetry via `navigator.sendBeacon` so in-flight
+ * events are not lost on tab close. `pagehide` is the reliable browser signal
+ * for app-launch teardown (it fires on bfcache, tab close, and navigation away
+ * where `unload` is unreliable). Both `endSession` and the beacon flush are
  * idempotent and best-effort, so firing on both `pagehide` and a `hidden`
  * visibility change is safe. Returns a teardown that removes the listeners.
  */
@@ -93,7 +95,12 @@ function installSessionEndHook(): () => void {
   }
   const end = () => {
     try {
-      getClient()?.endSession();
+      const client = getClient();
+      // Beacon-flush persisted telemetry BEFORE ending the session: beacon
+      // requests outlive the page, so this is the last chance to ship buffered
+      // events that a plain fetch would drop on tab close.
+      client?.flushViaBeacon();
+      client?.endSession();
     } catch {
       // fail-open
     }

@@ -47,6 +47,17 @@ export {
   type GitRunner,
   type ResolveReleaseOptions,
 } from './release';
+export {
+  OfflineQueue,
+  setPersistenceAdapter,
+  isPersistablePath,
+  BROWSER_LIMITS,
+  SERVER_LIMITS,
+  type PersistenceAdapter,
+  type PersistedEnvelope,
+  type OfflineQueueLimits,
+  type OfflineQueueOptions,
+} from './persistence';
 export { AllStakErrorBoundary, withAllStakErrorBoundary, type AllStakErrorBoundaryProps } from './error-boundary';
 export { registerAllStak, type RegisterAllStakOptions } from './instrumentation';
 export { captureUnderscoreErrorException, type NextErrorContext } from './pages-error';
@@ -75,6 +86,14 @@ export interface AllStakNextConfig {
    * shutdown, ok/errored/crashed status). Default true. Set false to opt out.
    */
   enableAutoSessionTracking?: boolean;
+  /**
+   * Persist un-sent telemetry so it survives a process/app restart AND a
+   * network outage, replaying it on the next init (Sentry-style offline store).
+   * Default true. Set false to opt out. Fully fail-open.
+   */
+  enableOfflineQueue?: boolean;
+  /** Spool directory for the Node fs offline store. Defaults to os.tmpdir(). */
+  offlineSpoolDir?: string;
 }
 
 export interface SourceMapUploadOptions {
@@ -103,6 +122,8 @@ export function initAllStakNext(config: AllStakNextConfig): void {
       environment: config.environment,
       release: config.release,
       enableAutoSessionTracking: config.enableAutoSessionTracking,
+      enableOfflineQueue: config.enableOfflineQueue,
+      offlineSpoolDir: config.offlineSpoolDir,
     }));
   }
 }

@@ -2,6 +2,12 @@ import { resolveDebugId } from './utils/debug-id';
 import { scrub } from './sanitize';
 import { getActiveMergedScope, type MergedScopeData } from './scope';
 import { resolveRelease, type GitRunner } from './release';
+import {
+  OfflineQueue,
+  isPersistablePath,
+  type OfflineQueueLimits,
+  type PersistedEnvelope,
+} from './persistence';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
@@ -188,6 +194,24 @@ export interface AllStakNextClientOptions {
   enableAutoSessionTracking?: boolean;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
+  /**
+   * Persist un-sent telemetry so it survives a process/app restart AND a
+   * network outage (Sentry-style offline store). When an event can't be
+   * delivered (network error, retries exhausted, offline, or shutdown with
+   * events still buffered) the already-PII-scrubbed payload is written to a
+   * persistent store and replayed on the next init.
+   *
+   * Backend is chosen per runtime: localStorage (browser), an fs spool dir
+   * (Node server), or in-memory degrade (edge/sandboxed). Session lifecycle
+   * calls are NEVER persisted. Default true. Set false to opt out. Fully
+   * fail-open. Automatically suppressed under a unit-test runtime
+   * (NODE_ENV=test / VITEST) unless explicitly set true.
+   */
+  enableOfflineQueue?: boolean;
+  /** Spool directory for the Node fs offline store. Defaults to os.tmpdir(). */
+  offlineSpoolDir?: string;
+  /** Override the offline store bounds (count / bytes / age). */
+  offlineQueueLimits?: Partial<OfflineQueueLimits>;
 }
 
 function clamp01(n: number | undefined): number {
@@ -208,6 +232,12 @@ export class AllStakNextClient {
   private breadcrumbs: Breadcrumb[] = [];
   private destroyed = false;
   private pendingRequests: Promise<void>[] = [];
+
+  // ── Offline / persistent event queue (survive restart + outage) ──
+  private readonly offlineQueueEnabled: boolean;
+  private readonly offlineQueue: OfflineQueue | null;
+  /** Resolves when the init-time drain finishes (test seam; fail-open). */
+  private drainOnInit: Promise<void> = Promise.resolve();
 
   // ── Release-health session state (one session per process / app-launch) ──
   private readonly platform: string;
@@ -237,11 +267,20 @@ export class AllStakNextClient {
     this.platform = detectPlatform();
     this.sessionId = generateSessionId();
     this.sessionTrackingEnabled = shouldAutoSessionTrack(options.enableAutoSessionTracking);
+    this.offlineQueueEnabled = shouldEnableOfflineQueue(options.enableOfflineQueue);
+    this.offlineQueue = this.offlineQueueEnabled
+      ? safeNewOfflineQueue({ spoolDir: options.offlineSpoolDir, limits: options.offlineQueueLimits })
+      : null;
     if (shouldAutoRegisterRelease(options.autoRegisterRelease)) {
       this.registerRuntimeRelease();
     }
     if (this.sessionTrackingEnabled) {
       this.startSession();
+    }
+    // Replay any telemetry persisted by a previous process/app launch. Async +
+    // fail-open: drain must never block init.
+    if (this.offlineQueue && this.apiKey) {
+      this.drainOnInit = this.drainPersistedQueue().catch(() => undefined);
     }
   }
 
@@ -489,6 +528,53 @@ export class AllStakNextClient {
     this.pendingRequests = [];
   }
 
+  /**
+   * Browser tab-close flush: best-effort deliver any persisted (failed/buffered)
+   * telemetry via `navigator.sendBeacon` so in-flight events are not lost when
+   * the tab is closing. Beacon requests outlive the page, unlike `fetch`.
+   * Entries that beacon accepts (queued by the browser) are removed from the
+   * store; the rest stay for the next launch. Synchronous + fully fail-open —
+   * safe to call from a `pagehide` / `visibilitychange('hidden')` listener.
+   */
+  flushViaBeacon(): void {
+    const queue = this.offlineQueue;
+    if (!queue || !this.apiKey) return;
+    const beacon = (globalThis as { navigator?: { sendBeacon?: (url: string, data?: BodyInit) => boolean } })
+      .navigator?.sendBeacon;
+    if (typeof beacon !== 'function') return;
+    try {
+      const pending = queue.loadAll();
+      if (pending.length === 0) return;
+      const survivors: PersistedEnvelope[] = [];
+      for (const env of pending) {
+        let sent = false;
+        try {
+          // sendBeacon can't set custom headers, so pass the API key as a query
+          // param; ingest accepts X-AllStak-Key or this fallback for beacons.
+          const url = `${this.host}${env.path}?allstak_key=${encodeURIComponent(this.apiKey)}`;
+          const blob = makeBeaconBlob(env.body);
+          sent = beacon.call((globalThis as { navigator: object }).navigator, url, blob);
+        } catch {
+          sent = false;
+        }
+        if (!sent) survivors.push(env);
+      }
+      queue.replaceAll(survivors);
+    } catch {
+      // fail-open
+    }
+  }
+
+  /** Whether the offline/persistent queue is active for this client. */
+  isOfflineQueueEnabled(): boolean {
+    return this.offlineQueueEnabled;
+  }
+
+  /** @internal test seam: await the init-time replay of the persisted store. */
+  async _awaitInitDrainForTest(): Promise<void> {
+    await this.drainOnInit;
+  }
+
   destroy(): void {
     // Graceful dispose path: end the session (best-effort) before tearing down.
     if (this.sessionTrackingEnabled) {
@@ -525,47 +611,97 @@ export class AllStakNextClient {
     await request;
   }
 
-  private async doFetch(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
+  /**
+   * Scrub a wire payload to its serialized body. One chokepoint protects every
+   * telemetry type. Pure (no caller mutation), fail-open on sanitizer error.
+   * Restores the SDK's own top-level `sessionId` correlation id that the
+   * substring denylist would otherwise redact.
+   */
+  private scrubToBody(payload: unknown): string {
     try {
-      // Scrub the full wire payload before serialization. One chokepoint
-      // protects every telemetry type. Pure (no caller mutation),
-      // fail-open on sanitizer error.
-      let body: string;
-      try {
-        const scrubbed = scrub(payload) as unknown;
-        // The sanitizer denylist substring-matches `session`, which would
-        // redact the SDK-generated release-health `sessionId` (a non-PII
-        // correlation id the backend NEEDS to attribute errors to a session).
-        // Restore only our own top-level id; user-supplied nested
-        // session/cookie/token keys stay redacted.
-        if (
-          scrubbed && typeof scrubbed === 'object' &&
-          payload && typeof payload === 'object' &&
-          typeof (payload as { sessionId?: unknown }).sessionId === 'string'
-        ) {
-          (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId: string }).sessionId;
-        }
-        body = JSON.stringify(scrubbed);
-      } catch {
-        body = JSON.stringify(payload);
+      const scrubbed = scrub(payload) as unknown;
+      if (
+        scrubbed && typeof scrubbed === 'object' &&
+        payload && typeof payload === 'object' &&
+        typeof (payload as { sessionId?: unknown }).sessionId === 'string'
+      ) {
+        (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId: string }).sessionId;
       }
+      return JSON.stringify(scrubbed);
+    } catch {
+      return JSON.stringify(payload);
+    }
+  }
 
-      const response = await this.postOnce(path, body, timeoutMs);
-      // Honor a server-provided Retry-After on 429/503: wait the indicated
-      // delay (capped at MAX_RETRY_AFTER_MS) and retry exactly once. Any
-      // other status — including 429/503 without a usable header — keeps the
-      // existing fail-open, no-retry behavior.
+  private async doFetch(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
+    // Scrub BEFORE anything touches the wire OR the persistent store — never
+    // persist secrets/unredacted data to disk/localStorage.
+    const body = this.scrubToBody(payload);
+    const outcome = await this.deliver(path, body, timeoutMs);
+    // Persist on failure so the event survives a restart/outage. Session
+    // lifecycle calls are excluded (handled inside the queue too).
+    if (outcome === 'failed' && this.offlineQueue && isPersistablePath(path)) {
+      this.offlineQueue.persist(path, body);
+    }
+  }
+
+  /**
+   * POST an already-scrubbed body once, honoring Retry-After on 429/503 exactly
+   * once. Returns the delivery outcome:
+   *   - `delivered`: a 2xx response (accepted).
+   *   - `dropped`:   a 4xx other than 429 (permanently undeliverable).
+   *   - `failed`:    network error, timeout, 429, 5xx, or any retry-able state
+   *                  (the caller may persist it).
+   * Never throws.
+   */
+  private async deliver(path: string, body: string, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<DeliveryOutcome> {
+    try {
+      let response = await this.postOnce(path, body, timeoutMs);
       if (response && (response.status === 429 || response.status === 503)) {
         const headerValue = response.headers?.get?.('Retry-After') ?? null;
         const waitMs = parseRetryAfter(headerValue, Date.now());
         if (waitMs > 0) {
           await new Promise((r) => setTimeout(r, waitMs));
-          await this.postOnce(path, body, timeoutMs);
+          response = await this.postOnce(path, body, timeoutMs);
         }
       }
+      return classifyResponse(response);
     } catch {
-      // fail-open: never throw into the host app
+      // Network error / timeout / abort — retry-able, persist it.
+      return 'failed';
     }
+  }
+
+  /**
+   * Drain telemetry persisted by a previous launch and re-send it through the
+   * existing transport. Removes an entry only after it is accepted (2xx) or is
+   * permanently undeliverable (4xx other than 429); a still-`failed` entry is
+   * retained for the next launch. Fully fail-open; runs asynchronously so init
+   * is never blocked.
+   */
+  private async drainPersistedQueue(): Promise<void> {
+    const queue = this.offlineQueue;
+    if (!queue || this.destroyed || !this.apiKey) return;
+    let pending: PersistedEnvelope[];
+    try {
+      pending = queue.loadAll();
+    } catch {
+      return;
+    }
+    if (pending.length === 0) return;
+
+    const survivors: PersistedEnvelope[] = [];
+    for (const env of pending) {
+      if (this.destroyed) {
+        survivors.push(env);
+        continue;
+      }
+      const outcome = await this.deliver(env.path, env.body);
+      // Keep only the ones that still couldn't be delivered. `delivered` and
+      // `dropped` (permanent 4xx) are both removed from the store.
+      if (outcome === 'failed') survivors.push(env);
+    }
+    queue.replaceAll(survivors);
   }
 
   private async postOnce(path: string, body: string, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<Response | undefined> {
@@ -634,6 +770,59 @@ function shouldAutoRegisterRelease(value: boolean | undefined): boolean {
   if (value === true) return true;
   const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
   return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+}
+
+/** Delivery outcome for a single transport attempt. */
+type DeliveryOutcome = 'delivered' | 'dropped' | 'failed';
+
+/**
+ * Classify an HTTP response into a delivery outcome:
+ *   - 2xx → `delivered` (accepted; remove from store).
+ *   - 4xx other than 429 → `dropped` (permanently undeliverable; remove).
+ *   - everything else (429, 5xx, or no response) → `failed` (retry-able; keep).
+ */
+function classifyResponse(response: Response | undefined): DeliveryOutcome {
+  if (!response) return 'failed';
+  const status = response.status;
+  if (status >= 200 && status < 300) return 'delivered';
+  if (status >= 400 && status < 500 && status !== 429) return 'dropped';
+  return 'failed';
+}
+
+/**
+ * Decide whether the offline/persistent queue is active. Defaults to TRUE, but
+ * is automatically suppressed under a unit-test runtime (NODE_ENV=test /
+ * VITEST) so the SDK's own tests don't touch localStorage/the fs spool. An
+ * explicit `true`/`false` always wins (tests opt in by passing `true`).
+ */
+function shouldEnableOfflineQueue(value: boolean | undefined): boolean {
+  if (value === false) return false;
+  if (value === true) return true;
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return env?.NODE_ENV !== 'test' && env?.VITEST !== 'true';
+}
+
+/** Construct an OfflineQueue without ever throwing into init (fail-open). */
+function safeNewOfflineQueue(opts: { spoolDir?: string; limits?: Partial<OfflineQueueLimits> }): OfflineQueue | null {
+  try {
+    return new OfflineQueue(opts);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Wrap a JSON body for `sendBeacon`. A typed Blob keeps the content-type as
+ * JSON where Blob is available; otherwise fall back to the raw string.
+ */
+function makeBeaconBlob(body: string): BodyInit {
+  try {
+    const B = (globalThis as { Blob?: typeof Blob }).Blob;
+    if (B) return new B([body], { type: 'application/json' });
+  } catch {
+    /* fall through */
+  }
+  return body;
 }
 
 /**
