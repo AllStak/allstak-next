@@ -109,6 +109,12 @@ await captureException(new Error('checkout failed'), {
 - Client errors missing: install global handlers or use the error boundary helper.
 - Source maps missing: use the same release value in runtime config and source-map upload.
 
+## Contributing and Support
+
+- Report bugs with the GitHub bug report template: https://github.com/AllStak/allstak-next/issues/new/choose
+- Open pull requests using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report security vulnerabilities privately through [SECURITY.md](SECURITY.md).
+
 ## License
 
 MIT
