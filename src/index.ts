@@ -94,6 +94,15 @@ export interface AllStakNextConfig {
   enableOfflineQueue?: boolean;
   /** Spool directory for the Node fs offline store. Defaults to os.tmpdir(). */
   offlineSpoolDir?: string;
+  /**
+   * Send personally-identifiable information found in free-text VALUES. Default
+   * FALSE (Sentry parity). Credit-card numbers (Luhn-valid) and hyphenated US
+   * SSNs are ALWAYS scrubbed regardless. While false, email and IPv4/IPv6
+   * addresses leaking into messages / metadata / breadcrumbs / captured HTTP
+   * fields are scrubbed too; set true to ship that PII. The explicit user
+   * object set via `setUser` is never value-scrubbed.
+   */
+  sendDefaultPii?: boolean;
 }
 
 export interface SourceMapUploadOptions {
@@ -124,6 +133,7 @@ export function initAllStakNext(config: AllStakNextConfig): void {
       enableAutoSessionTracking: config.enableAutoSessionTracking,
       enableOfflineQueue: config.enableOfflineQueue,
       offlineSpoolDir: config.offlineSpoolDir,
+      sendDefaultPii: config.sendDefaultPii,
     }));
   }
 }

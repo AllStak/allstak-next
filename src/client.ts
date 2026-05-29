@@ -212,6 +212,20 @@ export interface AllStakNextClientOptions {
   offlineSpoolDir?: string;
   /** Override the offline store bounds (count / bytes / age). */
   offlineQueueLimits?: Partial<OfflineQueueLimits>;
+  /**
+   * Send personally-identifiable information that the SDK would otherwise scrub
+   * from free-text VALUES. Default FALSE (Sentry parity). The redaction layers:
+   *   - ALWAYS scrubbed (regardless of this flag): credit-card numbers that
+   *     pass the Luhn checksum and hyphenated US SSNs — high-risk financial /
+   *     identity data never legitimately wanted in telemetry.
+   *   - Scrubbed only while this is FALSE: email addresses and IPv4/IPv6
+   *     addresses that leak into messages / metadata / breadcrumbs / captured
+   *     HTTP fields. Set TRUE to let the host opt into shipping that PII (and
+   *     to keep any auto-collected client IP the SDK attaches).
+   * The EXPLICIT user object set via `setUser` (id/email/ip) is intentional
+   * identification and is NEVER value-scrubbed by either layer, matching Sentry.
+   */
+  sendDefaultPii?: boolean;
 }
 
 function clamp01(n: number | undefined): number {
@@ -227,6 +241,7 @@ export class AllStakNextClient {
   private readonly environment: string;
   private readonly release: string;
   private readonly sampleRate: number;
+  private readonly sendDefaultPii: boolean;
   private readonly beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
   private readonly random: () => number;
   private breadcrumbs: Breadcrumb[] = [];
@@ -262,6 +277,7 @@ export class AllStakNextClient {
       version: SDK_VERSION,
     });
     this.sampleRate = clamp01(options.sampleRate);
+    this.sendDefaultPii = options.sendDefaultPii === true;
     this.beforeSend = options.beforeSend;
     this.random = options.random || Math.random;
     this.platform = detectPlatform();
@@ -619,7 +635,14 @@ export class AllStakNextClient {
    */
   private scrubToBody(payload: unknown): string {
     try {
-      const scrubbed = scrub(payload) as unknown;
+      // Key-name redaction (always) PLUS value-pattern PII scrubbing of
+      // free-text string values. (A) CC/SSN always; (B) email/IP unless the
+      // host opted into PII via sendDefaultPii. Key-aware: structural fields
+      // and the explicit user subtree are preserved (see sanitize.ts).
+      const scrubbed = scrub(payload, {
+        scrubValues: true,
+        sendDefaultPii: this.sendDefaultPii,
+      }) as unknown;
       if (
         scrubbed && typeof scrubbed === 'object' &&
         payload && typeof payload === 'object' &&
