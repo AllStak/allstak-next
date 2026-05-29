@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]## [0.2.0] — 2026-05-29
 
 Substantial feature wave on top of published `0.1.2`, reaching broad
-Sentry-style parity for the standalone Next.js SDK. Fully additive and
+standard parity for the standalone Next.js SDK. Fully additive and
 backward-compatible — no public API removed and existing behavior preserved.
 
 ### Added — Release-health session tracking
