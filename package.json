@@ -1,6 +1,6 @@
 {
   "name": "@allstak/next",
-  "version": "0.1.3",
+  "version": "0.2.0",
   "description": "Standalone AllStak Next.js SDK with source-map upload support. No @allstak/* runtime dependencies.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -55,7 +55,7 @@
     "vitest": "^1.6.1"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "license": "MIT"
 }

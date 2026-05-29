@@ -5,7 +5,7 @@ All notable changes to @allstak/next will be documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [Unreleased]## [0.2.0] — 2026-05-29
 
 Substantial feature wave on top of published `0.1.2`, reaching broad
 Sentry-style parity for the standalone Next.js SDK. Fully additive and

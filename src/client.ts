@@ -11,7 +11,7 @@ import {
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
-export const SDK_VERSION = '0.1.3';
+export const SDK_VERSION = '0.2.0';
 const TRANSPORT_TIMEOUT_MS = 3000;
 /** Shorter timeout for the session/end POST so graceful shutdown is never blocked. */
 const SESSION_END_TIMEOUT_MS = 1500;
