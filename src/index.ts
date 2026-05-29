@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 // Restores the public API that shipped on @allstak/next@0.1.0; the
 // short-circuit publish of 0.1.1 missed these because index.ts didn't
 // re-export from the freshly-tracked source files.
-import { AllStakNextClient, getClient, setClient, type SeverityLevel } from './client';
+import { AllStakNextClient, getClient, setClient, type SeverityLevel, type LogLevel } from './client';
 import {
   Scope,
   scopeManager,
@@ -15,6 +15,8 @@ import {
 } from './scope';
 import { initWebVitals } from './web-vitals';
 import { instrumentFetch } from './fetch-instrumentation';
+import { installAutoBreadcrumbs } from './breadcrumbs';
+import { installConsoleLogBridge, logToAllStak } from './logs';
 
 export {
   AllStakNextClient,
@@ -33,6 +35,9 @@ export {
   type SessionStatus,
   type StackFrame,
   type DebugImage,
+  type DbQueryPayload,
+  type LogLevel,
+  type LogPayload,
   _resetRuntimeReleaseRegistrationForTest,
 } from './client';
 export { Scope } from './scope';
@@ -83,6 +88,37 @@ export {
   type RouteTelemetryContext,
   type ServerActionTelemetryOptions,
 } from './route-handler';
+export {
+  installDbInstrumentation,
+  instrumentPgDriver,
+  instrumentPrisma,
+  allstakDrizzleLogger,
+  type DbInstrumentationOptions,
+  type PrismaInstrumentationOptions,
+  type DrizzleLogger,
+  type DrizzleLoggerOptions,
+} from './db-instrumentation';
+export {
+  logToAllStak,
+  installConsoleLogBridge,
+  uninstallConsoleLogBridge,
+  isConsoleLogBridgeInstalled,
+  allstakPinoStream,
+  allstakWinstonTransport,
+  type LogToAllStakOptions,
+  type ConsoleLogBridgeOptions,
+  type PinoDestinationStream,
+} from './logs';
+export {
+  installAutoBreadcrumbs,
+  areAutoBreadcrumbsInstalled,
+  type BreadcrumbCollectorOptions,
+} from './breadcrumbs';
+export {
+  bootstrapAllStakClient,
+  isClientBootstrapped,
+  type ClientBootstrapOptions,
+} from './instrumentation-client';
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 
@@ -101,7 +137,7 @@ export interface AllStakNextConfig {
   enableAutoSessionTracking?: boolean;
   /**
    * Persist un-sent telemetry so it survives a process/app restart AND a
-   * network outage, replaying it on the next init (Sentry-style offline store).
+   * network outage, replaying it on the next init (offline store).
    * Default true. Set false to opt out. Fully fail-open.
    */
   enableOfflineQueue?: boolean;
@@ -109,7 +145,7 @@ export interface AllStakNextConfig {
   offlineSpoolDir?: string;
   /**
    * Send personally-identifiable information found in free-text VALUES. Default
-   * FALSE (Sentry parity). Credit-card numbers (Luhn-valid) and hyphenated US
+   * FALSE. Credit-card numbers (Luhn-valid) and hyphenated US
    * SSNs are ALWAYS scrubbed regardless. While false, email and IPv4/IPv6
    * addresses leaking into messages / metadata / breadcrumbs / captured HTTP
    * fields are scrubbed too; set true to ship that PII. The explicit user
@@ -130,6 +166,20 @@ export interface AllStakNextConfig {
    * true. Set false to opt out. Fully fail-open.
    */
   enableOutboundHttp?: boolean;
+  /**
+   * Install the browser console/navigation/fetch breadcrumb collectors so any
+   * error captured afterwards carries recent activity context automatically.
+   * Default TRUE in browser contexts (a no-op on the server/edge). Set false to
+   * opt out.
+   */
+  enableAutoBreadcrumbs?: boolean;
+  /**
+   * Bridge `console.{debug,info,warn,error}` to `/ingest/v1/logs` so existing
+   * `console.*` calls become structured logs (error+Error promoted to an
+   * event). The original console output is always preserved. Default TRUE. Set
+   * false to opt out.
+   */
+  enableConsoleLogs?: boolean;
 }
 
 export interface SourceMapUploadOptions {
@@ -165,10 +215,11 @@ export function initAllStakNext(config: AllStakNextConfig): void {
     }));
   }
 
-  // Browser-side instrumentation: Core Web Vitals (default on) and the outbound
-  // fetch wrapper (default on). Both are fully fail-open and no-ops on the
-  // server/edge. On the server/edge the outbound wrapper is installed by
-  // registerAllStak instead.
+  // Browser-side instrumentation: Core Web Vitals (default on), the outbound
+  // fetch wrapper (default on), auto-breadcrumbs (default on), and the
+  // console→logs bridge (default on). All fully fail-open and no-ops on the
+  // server/edge. On the server/edge the outbound wrapper + console bridge are
+  // installed by registerAllStak instead.
   if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     if (config.enableWebVitals !== false) {
       try {
@@ -184,7 +235,31 @@ export function initAllStakNext(config: AllStakNextConfig): void {
         // fail-open
       }
     }
+    if (config.enableAutoBreadcrumbs !== false) {
+      try {
+        installAutoBreadcrumbs();
+      } catch {
+        // fail-open
+      }
+    }
+    if (config.enableConsoleLogs !== false) {
+      try {
+        installConsoleLogBridge();
+      } catch {
+        // fail-open
+      }
+    }
   }
+}
+
+/**
+ * Forward a structured log line to `/ingest/v1/logs` on demand through the
+ * registered client. warn/error/fatal add a breadcrumb; error/fatal carrying
+ * an `Error` are promoted to `captureException`. Safe no-op if no client is
+ * registered. Fully fail-open.
+ */
+export function captureLog(level: LogLevel, message: string, meta?: Record<string, unknown>): void {
+  logToAllStak(level, message, { meta });
 }
 
 /**
@@ -299,12 +374,25 @@ export async function processNextSourceMaps(options: SourceMapUploadOptions): Pr
 export interface WithAllStakOptions extends Partial<SourceMapUploadOptions> {
   tunnelRoute?: string;
   silent?: boolean;
+  /**
+   * Inject the auto-running client bootstrap (`@allstak/next/client`) into the
+   * browser bundle so browser errors / Core Web Vitals / fetch breadcrumbs are
+   * live from `NEXT_PUBLIC_*` env with NO manual `installGlobalErrorHandlers()`
+   * call. Default true. Set false to opt out (e.g. you wire a root
+   * `instrumentation-client.ts` yourself). Fully fail-open: a webpack-entry
+   * shape we don't recognize is left untouched.
+   */
+  clientBootstrap?: boolean;
 }
+
+/** The client bootstrap entry module injected into the browser compilation. */
+const CLIENT_BOOTSTRAP_IMPORT = '@allstak/next/client';
 
 export function withAllStak(allstak: WithAllStakOptions, nextConfig: Record<string, unknown> = {}): Record<string, unknown> {
   const userWebpack = nextConfig.webpack as ((config: any, ctx: any) => any) | undefined;
   const userRewrites = nextConfig.rewrites as (() => unknown | Promise<unknown>) | undefined;
   const tunnelRoute = normalizeTunnelRoute(allstak.tunnelRoute);
+  const injectClient = allstak.clientBootstrap !== false;
   return {
     ...nextConfig,
     productionBrowserSourceMaps: nextConfig.productionBrowserSourceMaps ?? true,
@@ -328,6 +416,17 @@ export function withAllStak(allstak: WithAllStakOptions, nextConfig: Record<stri
           });
         },
       });
+
+      // Auto-inject the client bootstrap into the BROWSER compilation only, so
+      // the browser instrumentation runs without a manual call. We prepend our
+      // import ahead of Next's `main` entry. Fully fail-open and idempotent.
+      if (injectClient && !ctx?.isServer) {
+        try {
+          config.entry = wrapEntryWithClientBootstrap(config.entry);
+        } catch {
+          // fail-open: never break the host build over the bootstrap injection
+        }
+      }
 
       if (!ctx?.isServer && !ctx?.dev && allstak.release && allstak.uploadToken) {
         const plugin = {
@@ -353,6 +452,56 @@ export function withAllStak(allstak: WithAllStakOptions, nextConfig: Record<stri
       return userWebpack ? userWebpack(config, ctx) : config;
     },
   };
+}
+
+/**
+ * Prepend the client bootstrap import to Next's browser entry. Next's
+ * `config.entry` is a function returning a Promise of an entry map; entry
+ * values are usually a string or an array of strings (sometimes `{ import }`
+ * descriptors). We add our import to the `main-app` / `main` entry (where
+ * Next puts the app shell) without removing anything, and only when it isn't
+ * already present (idempotent). Any unrecognized shape is returned unchanged.
+ */
+export function wrapEntryWithClientBootstrap(entry: unknown): unknown {
+  if (typeof entry !== 'function') return entry;
+  const original = entry as () => Promise<Record<string, unknown>> | Record<string, unknown>;
+  return async function allstakEntry(): Promise<Record<string, unknown>> {
+    const resolved = await original();
+    try {
+      // Prefer the app-router shell entry; fall back to the pages-router one.
+      const target = resolved['main-app'] !== undefined ? 'main-app' : 'main';
+      resolved[target] = addImport(resolved[target]);
+    } catch {
+      // fail-open: hand back the entry untouched
+    }
+    return resolved;
+  };
+}
+
+/** Add the bootstrap import to a single webpack entry value, idempotently. */
+function addImport(value: unknown): unknown {
+  if (value === undefined || value === null) {
+    return [CLIENT_BOOTSTRAP_IMPORT];
+  }
+  if (typeof value === 'string') {
+    return value === CLIENT_BOOTSTRAP_IMPORT ? value : [CLIENT_BOOTSTRAP_IMPORT, value];
+  }
+  if (Array.isArray(value)) {
+    return value.includes(CLIENT_BOOTSTRAP_IMPORT) ? value : [CLIENT_BOOTSTRAP_IMPORT, ...value];
+  }
+  // `{ import: string | string[], ... }` descriptor form.
+  if (typeof value === 'object') {
+    const desc = value as { import?: string | string[] };
+    const imp = desc.import;
+    if (typeof imp === 'string') {
+      return { ...desc, import: imp === CLIENT_BOOTSTRAP_IMPORT ? imp : [CLIENT_BOOTSTRAP_IMPORT, imp] };
+    }
+    if (Array.isArray(imp)) {
+      return { ...desc, import: imp.includes(CLIENT_BOOTSTRAP_IMPORT) ? imp : [CLIENT_BOOTSTRAP_IMPORT, ...imp] };
+    }
+    return { ...desc, import: [CLIENT_BOOTSTRAP_IMPORT] };
+  }
+  return value;
 }
 
 function normalizeTunnelRoute(route: string | undefined): string | undefined {

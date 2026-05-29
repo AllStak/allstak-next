@@ -1,6 +1,6 @@
 {
   "name": "@allstak/next",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Standalone AllStak Next.js SDK with source-map upload support. No @allstak/* runtime dependencies.",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
@@ -10,6 +10,11 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.mjs",
       "require": "./dist/index.js"
+    },
+    "./client": {
+      "types": "./dist/instrumentation-client.d.ts",
+      "import": "./dist/instrumentation-client.mjs",
+      "require": "./dist/instrumentation-client.js"
     }
   },
   "files": [
@@ -30,7 +35,8 @@
     "access": "public"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format cjs,esm --dts --sourcemap",
+    "build": "tsup src/index.ts src/instrumentation-client.ts --format cjs,esm --dts --sourcemap --clean",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json",
     "test": "vitest run",
     "pack:dry": "npm pack --dry-run"
   },

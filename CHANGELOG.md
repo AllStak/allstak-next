@@ -5,7 +5,54 @@ All notable changes to @allstak/next will be documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]## [0.2.0] — 2026-05-29
+## [0.3.0] — 2026-05-30
+
+Auto-instrumentation wave: makes database capture, structured logs, and the
+browser breadcrumb trail / client bootstrap AUTOMATIC. Fully additive and
+backward-compatible — no public API removed and existing behavior preserved.
+Every new collector is default-ON and individually toggleable.
+
+### Added — Database query auto-instrumentation
+- `src/db-instrumentation.ts`: opt-in-by-default driver wrappers wired from
+  `registerAllStak` when the module resolves. `pg` (`Client.prototype.query`,
+  covering Pool + prepared/named queries + transactions) is auto-patched;
+  `instrumentPrisma(client)` (via `$on('query')`) and `allstakDrizzleLogger()`
+  (Drizzle `logger` hook) cover the ORMs that need a live instance. Queries are
+  NORMALIZED — string/numeric literals masked to `?` — before they leave the
+  SDK (bound values never reach the wire) and emitted to `/ingest/v1/db`.
+  Gated by `enableDbInstrumentation` (default true). Node-server only; fully
+  fail-open.
+
+### Added — Logs bridge
+- `src/logs.ts`: forwards structured logs to `/ingest/v1/logs`. `logToAllStak`
+  primitive, a default-ON `console.{debug,info,warn,error}` bridge
+  (`installConsoleLogBridge`, wired from `registerAllStak` server-side and the
+  browser bootstrap), a pino destination stream (`allstakPinoStream`), and a
+  winston transport (`allstakWinstonTransport`, optional peer). `error`/`fatal`
+  logs carrying an `Error` are promoted to `captureException`; warn/error/fatal
+  add a breadcrumb. Message + metadata flow through the existing scrub
+  chokepoint. Gated by `enableConsoleLogs` (default true). Fully fail-open.
+
+### Added — Auto breadcrumbs + client bootstrap
+- `src/breadcrumbs.ts`: console / navigation (History API + popstate) / fetch
+  breadcrumb collectors that record onto the active scope, so any error
+  captured afterwards carries recent context automatically. Default-ON in the
+  browser (`installGlobalErrorHandlers` + the client bootstrap); gated by
+  `enableAutoBreadcrumbs`.
+- `src/instrumentation-client.ts` (`@allstak/next/client` subpath): an
+  auto-running browser bootstrap from `NEXT_PUBLIC_*` env — registers a client
+  and installs global error handlers, Core Web Vitals, the outbound-fetch
+  tracer, auto-breadcrumbs, and the console→log bridge with no manual call.
+  Re-export it from a root `instrumentation-client.ts`, or let `withAllStak()`
+  inject the client entry into the browser bundle (default on,
+  `clientBootstrap: false` to opt out).
+
+### Tests
+- Build + DTS green; new `typecheck` script (`tsconfig.build.json`, src-only).
+  229/229 tests pass (22 files), up from 189 (+40 across db / logs /
+  breadcrumbs / client-bootstrap / entry-injection).
+
+## [0.2.0] — 2026-05-29
 
 Substantial feature wave on top of published `0.1.2`, reaching broad
 standard parity for the standalone Next.js SDK. Fully additive and
@@ -94,8 +141,8 @@ the published npm package. No public API change.
   scrubbed before `JSON.stringify`. Fail-open.
 
 ### Live canary E2E
-- Event `369961a0-1e47-43db-bf81-59407a728af2` against `api.allstak.sa`.
-  ClickHouse `leak_pos = 0` across `metadata` / `stack_trace` /
+- End-to-end canary event sent against `api.allstak.sa`. Ingest-side
+  inspection found `leak_pos = 0` across `metadata` / `stack_trace` /
   `breadcrumbs` / `message`. Canary planted in 11 sensitive fields +
   3-level-nested `token` — all scrubbed.
 

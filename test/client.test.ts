@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { AllStakNextClient, parseStack, getClient, setClient, parseRetryAfter } from '../src/client';
+import { AllStakNextClient, parseStack, getClient, setClient, parseRetryAfter, SDK_VERSION } from '../src/client';
 
 describe('AllStakNextClient', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
@@ -41,7 +41,7 @@ describe('AllStakNextClient', () => {
     expect(body.timestamp).toBeTypeOf('string');
     expect(() => new Date(body.timestamp).toISOString()).not.toThrow();
     expect(body.sdkName).toBe('@allstak/next');
-    expect(body.sdkVersion).toBe('0.2.0');
+    expect(body.sdkVersion).toBe(SDK_VERSION);
     expect(body.platform).toBe('node');
     expect(body.stackTrace).toBeInstanceOf(Array);
     if (body.stackTrace.length > 0) {

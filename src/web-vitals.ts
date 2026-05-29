@@ -4,9 +4,9 @@ import { getClient } from './client';
  * Core Web Vitals collection for the browser bundle.
  *
  * Vitals are ingested AS SPANS via `POST /ingest/v1/spans` with `op="web.vital"`
- * (the backend `PerformanceRepository` classifies that op into the "web"
- * category and persists the `measurements` column to ClickHouse — that is how
- * vitals reach the web-vitals dashboard). We collect LCP/CLS/INP/FCP/TTFB with
+ * (the AllStak ingest API classifies that op into the "web" category and stores
+ * the `measurements` map — that is how vitals reach the web-vitals dashboard).
+ * We collect LCP/CLS/INP/FCP/TTFB with
  * `PerformanceObserver` directly (no `web-vitals` dependency), finalize on the
  * standard reporting moment — `visibilitychange('hidden')` / `pagehide` — and
  * emit a single `web.vital` span. Everything is best-effort and fully fail-open:

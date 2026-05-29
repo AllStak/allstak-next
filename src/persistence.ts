@@ -7,7 +7,7 @@
 // of being dropped. On the next SDK init the store is drained and the events
 // are re-sent through the existing transport.
 //
-// Design notes mirroring @sentry's offline transport:
+// Offline transport design notes:
 //   - Entries are stored as scrubbed JSON envelopes ({ path, body }), NEVER
 //     unredacted data — the caller scrubs before calling persist().
 //   - The store is BOUNDED by entry count, total bytes, AND max age. When full

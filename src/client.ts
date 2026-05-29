@@ -11,7 +11,7 @@ import {
 
 const DEFAULT_HOST = 'https://api.allstak.sa';
 export const SDK_NAME = '@allstak/next';
-export const SDK_VERSION = '0.2.0';
+export const SDK_VERSION = '0.3.0';
 const TRANSPORT_TIMEOUT_MS = 3000;
 /** Shorter timeout for the session/end POST so graceful shutdown is never blocked. */
 const SESSION_END_TIMEOUT_MS = 1500;
@@ -128,10 +128,10 @@ export interface SpanPayload {
 /**
  * A span emitted to `/ingest/v1/spans` that carries a numeric `measurements`
  * map (the wire shape the backend `PerformanceRepository` reads). Used for Core
- * Web Vitals, which are ingested AS SPANS with `op="web.vital"`: the backend
+ * Web Vitals, which are ingested AS SPANS with `op="web.vital"`: the ingest API
  * classifies op IN ('pageload','navigation','browser.resource','web.vital') as
- * the "web" category and persists the `measurements` column to ClickHouse,
- * which is how vitals reach the web-vitals dashboard.
+ * the "web" category and stores the `measurements` map, which is how vitals
+ * reach the web-vitals dashboard.
  *
  * This is a superset of {@link SpanPayload} aligned with the backend SpanItem
  * shape: it adds `op`, `measurements`, `sessionId`, and `platform`, and most
@@ -177,6 +177,61 @@ export interface HttpRequestPayload {
 }
 
 /**
+ * A single database query telemetry record sent (batched) to
+ * `/ingest/v1/db`. Matches the backend `DbQueryIngestRequest` item shape used
+ * by the other AllStak SDKs: the query text is ALWAYS normalized (literals
+ * masked to `?`) before it leaves the SDK so bound values never reach the
+ * wire — only the parameterized shape, its hash, and timing/status do.
+ */
+export interface DbQueryPayload {
+  /** Parameterized query text with literals masked (no bound values). */
+  normalizedQuery: string;
+  /** Stable hash of `normalizedQuery` for dedup/aggregation. */
+  queryHash: string;
+  /** SELECT / INSERT / UPDATE / DELETE / BEGIN / COMMIT / ROLLBACK / OTHER. */
+  queryType: string;
+  durationMs: number;
+  timestampMillis: number;
+  /** `success` | `error`. */
+  status: string;
+  errorMessage?: string;
+  databaseName?: string;
+  /** postgresql | mysql | sqlite | mongodb | mssql. */
+  databaseType?: string;
+  service?: string;
+  environment?: string;
+  release?: string;
+  traceId?: string;
+  spanId?: string;
+  rowsAffected?: number;
+}
+
+/**
+ * Severity for a structured log forwarded to `/ingest/v1/logs`. Mirrors the
+ * backend `LogIngestRequest` levels used by the other AllStak SDKs.
+ */
+export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
+
+/**
+ * A structured log line forwarded to `/ingest/v1/logs`. Matches the backend
+ * `LogIngestRequest` DTO shape: top-level routing scalars plus a free-text
+ * `message` and an arbitrary `metadata` bag (both scrubbed on the wire path).
+ */
+export interface LogPayload {
+  level: string;
+  message: string;
+  service?: string;
+  traceId?: string;
+  environment?: string;
+  release?: string;
+  spanId?: string;
+  requestId?: string;
+  userId?: string;
+  errorId?: string;
+  metadata?: Record<string, unknown>;
+}
+
+/**
  * Outbound error/message event passed to `beforeSend`. This is the
  * fully-built wire payload (before redaction). Returning `null` drops it.
  */
@@ -219,7 +274,7 @@ export interface AllStakNextClientOptions {
    */
   autoRegisterRelease?: boolean;
   /**
-   * Enable release-health session tracking (Sentry-style "one session per
+   * Enable release-health session tracking ("one session per
    * process / app-launch"). When true (the default), the client POSTs
    * `/ingest/v1/sessions/start` at init and `/ingest/v1/sessions/end` on
    * graceful shutdown, tracking a local ok/errored/crashed status in between.
@@ -231,7 +286,7 @@ export interface AllStakNextClientOptions {
   gitRunner?: GitRunner;
   /**
    * Persist un-sent telemetry so it survives a process/app restart AND a
-   * network outage (Sentry-style offline store). When an event can't be
+   * network outage (offline store). When an event can't be
    * delivered (network error, retries exhausted, offline, or shutdown with
    * events still buffered) the already-PII-scrubbed payload is written to a
    * persistent store and replayed on the next init.
@@ -257,7 +312,7 @@ export interface AllStakNextClientOptions {
   enableOutboundHttp?: boolean;
   /**
    * Send personally-identifiable information that the SDK would otherwise scrub
-   * from free-text VALUES. Default FALSE (Sentry parity). The redaction layers:
+   * from free-text VALUES. Default FALSE. The redaction layers:
    *   - ALWAYS scrubbed (regardless of this flag): credit-card numbers that
    *     pass the Luhn checksum and hyphenated US SSNs — high-risk financial /
    *     identity data never legitimately wanted in telemetry.
@@ -266,7 +321,7 @@ export interface AllStakNextClientOptions {
    *     HTTP fields. Set TRUE to let the host opt into shipping that PII (and
    *     to keep any auto-collected client IP the SDK attaches).
    * The EXPLICIT user object set via `setUser` (id/email/ip) is intentional
-   * identification and is NEVER value-scrubbed by either layer, matching Sentry.
+   * identification and is NEVER value-scrubbed by either layer.
    */
   sendDefaultPii?: boolean;
 }
@@ -599,6 +654,40 @@ export class AllStakNextClient {
         environment: request.environment ?? this.environment,
         release: request.release ?? this.release,
       }],
+    });
+  }
+
+  /**
+   * Emit a database-query telemetry record to `/ingest/v1/db`. The query text
+   * is expected to be ALREADY normalized by the integration (literals masked
+   * to `?`); the transport scrub layer is a second line of defence. Filled in
+   * with this client's environment/release when the integration left them
+   * blank. Fail-open: never throws into the host query chain.
+   */
+  async captureDbQuery(query: DbQueryPayload): Promise<void> {
+    if (this.destroyed || !this.apiKey) return;
+    await this.send('/ingest/v1/db', {
+      queries: [{
+        ...query,
+        environment: query.environment ?? this.environment,
+        release: query.release ?? this.release,
+      }],
+    });
+  }
+
+  /**
+   * Forward a structured log line to `/ingest/v1/logs`. The free-text
+   * `message` and the `metadata` bag flow through the standard scrub
+   * chokepoint (key-name redaction always; CC/SSN always; email/IP unless
+   * `sendDefaultPii`). Filled in with this client's environment/release/session
+   * when the caller left them blank. Fail-open.
+   */
+  async captureLog(log: LogPayload): Promise<void> {
+    if (this.destroyed || !this.apiKey) return;
+    await this.send('/ingest/v1/logs', {
+      ...log,
+      environment: log.environment ?? this.environment,
+      release: log.release ?? this.release,
     });
   }
 

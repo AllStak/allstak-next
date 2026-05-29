@@ -8,7 +8,7 @@
 //     denylist defined in docs/standards/sdk-platform-standards.md.
 //
 //  2. VALUE-PATTERN redaction (opt-in via `scrubValues`). Scrubs PII that leaks
-//     into free-text string VALUES, matching @sentry data-scrubbing parity:
+//     into free-text string VALUES:
 //       A) ALWAYS scrubbed — credit-card numbers that pass the Luhn checksum,
 //          and US SSNs written with hyphens. (Financial/identity data is never
 //          legitimately wanted in telemetry, regardless of sendDefaultPii.)
@@ -67,7 +67,7 @@ export const DEFAULT_DENYLIST = [
  * email-looking token would corrupt legitimate data (paths, versions, ids) or
  * strip data the host intentionally set. Matched case-insensitively as exact
  * keys. The `user` key additionally short-circuits the whole subtree
- * (explicit setUser data — id/email/ip — ships as-is, matching Sentry).
+ * (explicit setUser data — id/email/ip — ships as-is).
  */
 const VALUE_SCRUB_KEY_ALLOWLIST = new Set([
   // Stack frame / source identification — must stay byte-exact for symbolication.
@@ -210,8 +210,7 @@ export interface ScrubOptions {
   scrubValues?: boolean;
   /**
    * When true, layer (B) value scrubbers (email/IP) are disabled — the host has
-   * opted into PII. Layer (A) (CC/SSN) is ALWAYS applied. Default false
-   * (Sentry parity).
+   * opted into PII. Layer (A) (CC/SSN) is ALWAYS applied. Default false.
    */
   sendDefaultPii?: boolean;
 }

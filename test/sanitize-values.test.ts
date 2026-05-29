@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { scrub, scrubStringValue, luhnValid, REDACTED } from '../src/sanitize';
 
-// Value-pattern PII scrubbing (@sentry data-scrubbing parity). Layer (A) is
+// Value-pattern PII scrubbing of free-text string values. Layer (A) is
 // always on; layer (B) is gated by sendDefaultPii.
 const ON = { scrubValues: true } as const; // sendDefaultPii defaults to false
 const PII_OK = { scrubValues: true, sendDefaultPii: true } as const;

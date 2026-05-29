@@ -1,5 +1,7 @@
 import { getClient } from './client';
 import { initWebVitals } from './web-vitals';
+import { installAutoBreadcrumbs } from './breadcrumbs';
+import { installConsoleLogBridge } from './logs';
 
 export interface GlobalErrorHandlerOptions {
   /**
@@ -9,6 +11,18 @@ export interface GlobalErrorHandlerOptions {
    * manually and don't want the automatic observers as well).
    */
   enableWebVitals?: boolean;
+  /**
+   * Install the console/navigation/fetch breadcrumb collectors so any error
+   * captured afterwards carries recent activity context automatically. Default
+   * TRUE in the browser. Set false to opt out.
+   */
+  enableAutoBreadcrumbs?: boolean;
+  /**
+   * Bridge `console.{debug,info,warn,error}` to `/ingest/v1/logs` (error+Error
+   * promoted to captureException). The original console output is always
+   * preserved. Default TRUE in the browser. Set false to opt out.
+   */
+  enableConsoleLogs?: boolean;
 }
 
 /**
@@ -89,13 +103,32 @@ export function installGlobalErrorHandlers(options: GlobalErrorHandlerOptions = 
   // never affects the host page, and emission happens on pagehide/hidden.
   const teardownWebVitals = options.enableWebVitals === false ? () => {} : installWebVitalsHook();
 
+  // Auto-breadcrumbs (console/navigation/fetch): default ON so browser errors
+  // captured here carry recent activity context with no manual addBreadcrumb.
+  const teardownBreadcrumbs = options.enableAutoBreadcrumbs === false ? () => {} : safeInstall(installAutoBreadcrumbs);
+
+  // Console→logs bridge: default ON so browser `console.*` calls become
+  // structured logs (error+Error promoted to an event). Host output preserved.
+  const teardownConsoleLogs = options.enableConsoleLogs === false ? () => {} : safeInstall(installConsoleLogBridge);
+
   // Return a teardown function
   return () => {
     window.onerror = prevOnError;
     window.onunhandledrejection = prevOnUnhandledRejection;
     removeSessionHooks();
     teardownWebVitals();
+    teardownBreadcrumbs();
+    teardownConsoleLogs();
   };
+}
+
+/** Install a browser collector, never throwing into the host install. */
+function safeInstall(install: () => () => void): () => void {
+  try {
+    return install();
+  } catch {
+    return () => {};
+  }
 }
 
 /** Start Core Web Vitals collection, never throwing into the host install. */

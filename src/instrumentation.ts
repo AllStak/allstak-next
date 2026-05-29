@@ -1,11 +1,28 @@
 import { AllStakNextClient, AllStakNextClientOptions, setClient, getClient } from './client';
 import { instrumentFetch } from './fetch-instrumentation';
+import { installDbInstrumentation, type DbInstrumentationOptions } from './db-instrumentation';
+import { installConsoleLogBridge } from './logs';
 
 export interface RegisterAllStakOptions extends AllStakNextClientOptions {
   /** Capture uncaughtException on the server. Defaults to true. */
   captureUncaughtExceptions?: boolean;
   /** Capture unhandledRejection on the server. Defaults to true. */
   captureUnhandledRejections?: boolean;
+  /**
+   * Auto-wire database query instrumentation that needs no live client
+   * instance (the `pg` driver). Default true. Pass `false` to disable, or an
+   * options object to toggle individual drivers. ORM integrations that need a
+   * client instance (Prisma, Drizzle) are wired via the `instrumentPrisma()` /
+   * `allstakDrizzleLogger()` exports. No-op outside the Node server runtime.
+   */
+  enableDbInstrumentation?: boolean | DbInstrumentationOptions;
+  /**
+   * Bridge `console.{debug,info,warn,error}` to `/ingest/v1/logs` so existing
+   * `console.*` calls become structured logs (error+Error promoted to
+   * captureException). Default true. The original console output is always
+   * preserved. Set false to opt out.
+   */
+  enableConsoleLogs?: boolean;
 }
 
 /**
@@ -37,6 +54,30 @@ export function registerAllStak(options: RegisterAllStakOptions): AllStakNextCli
   if (options.enableOutboundHttp !== false) {
     try {
       instrumentFetch();
+    } catch {
+      // fail-open
+    }
+  }
+
+  // Database query instrumentation (node server only): auto-wire the driver
+  // wrappers that need no live client instance (currently `pg`). Default on,
+  // individually toggleable, fully fail-open. No-op on edge/browser.
+  if (options.enableDbInstrumentation !== false) {
+    try {
+      installDbInstrumentation(
+        typeof options.enableDbInstrumentation === 'object' ? options.enableDbInstrumentation : {},
+      );
+    } catch {
+      // fail-open
+    }
+  }
+
+  // Console→logs bridge (default on): forward server-side `console.*` calls to
+  // `/ingest/v1/logs` as structured logs, promoting error+Error to an event.
+  // The original console output is always preserved. Fully fail-open.
+  if (options.enableConsoleLogs !== false) {
+    try {
+      installConsoleLogBridge();
     } catch {
       // fail-open
     }
