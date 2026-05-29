@@ -117,7 +117,7 @@ describe('scrub — value scrubbing wired into recursion', () => {
     const out = scrub(
       {
         release: '1.2.3',
-        sdkVersion: '0.1.3',
+        sdkVersion: '0.2.0',
         // A filename that incidentally contains an email-like token must survive.
         frames: [{ filename: '/app/user@2x/handler.ts', function: 'handle' }],
         // host/path/url are routing identity and have their own redactor.
@@ -128,7 +128,7 @@ describe('scrub — value scrubbing wired into recursion', () => {
       ON,
     ) as any;
     expect(out.release).toBe('1.2.3');
-    expect(out.sdkVersion).toBe('0.1.3');
+    expect(out.sdkVersion).toBe('0.2.0');
     expect(out.frames[0].filename).toBe('/app/user@2x/handler.ts');
     expect(out.frames[0].function).toBe('handle');
     expect(out.host).toBe('192.168.0.1');
