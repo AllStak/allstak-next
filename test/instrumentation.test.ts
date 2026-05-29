@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { registerAllStak } from '../src/instrumentation';
 import { getClient, setClient } from '../src/client';
+import { isFetchInstrumented, uninstrumentFetch } from '../src/fetch-instrumentation';
 
 describe('registerAllStak', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
@@ -9,11 +10,23 @@ describe('registerAllStak', () => {
     fetchSpy = vi.fn().mockResolvedValue({ ok: true });
     vi.stubGlobal('fetch', fetchSpy);
     setClient(null);
+    uninstrumentFetch();
   });
 
   afterEach(() => {
     setClient(null);
+    uninstrumentFetch();
     vi.restoreAllMocks();
+  });
+
+  it('instruments outbound fetch by default', () => {
+    registerAllStak({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    expect(isFetchInstrumented()).toBe(true);
+  });
+
+  it('does NOT instrument outbound fetch when enableOutboundHttp is false', () => {
+    registerAllStak({ apiKey: 'ask_test', host: 'https://api.allstak.sa', enableOutboundHttp: false });
+    expect(isFetchInstrumented()).toBe(false);
   });
 
   it('creates and sets the client singleton', () => {

@@ -1,10 +1,23 @@
 import { getClient } from './client';
+import { initWebVitals } from './web-vitals';
+
+export interface GlobalErrorHandlerOptions {
+  /**
+   * Collect Core Web Vitals (LCP/CLS/INP/FCP/TTFB) via PerformanceObserver and
+   * emit them as `web.vital` spans. Default TRUE in the browser. Set false to
+   * opt out (e.g. if you wire Next's `useReportWebVitals` + `reportWebVitals`
+   * manually and don't want the automatic observers as well).
+   */
+  enableWebVitals?: boolean;
+}
 
 /**
  * Install global browser error handlers that forward to the AllStak client.
  *
  * Chains any previously-installed `window.onerror` and
  * `window.onunhandledrejection` handlers so existing behaviour is preserved.
+ * Also starts Core Web Vitals collection by default (set
+ * `enableWebVitals: false` to opt out).
  *
  * ```tsx
  * // app/layout.tsx  (client component wrapper)
@@ -13,7 +26,7 @@ import { getClient } from './client';
  * if (typeof window !== 'undefined') installGlobalErrorHandlers();
  * ```
  */
-export function installGlobalErrorHandlers(): () => void {
+export function installGlobalErrorHandlers(options: GlobalErrorHandlerOptions = {}): () => void {
   if (typeof window === 'undefined') {
     return () => {};
   }
@@ -72,12 +85,26 @@ export function installGlobalErrorHandlers(): () => void {
 
   const removeSessionHooks = installSessionEndHook();
 
+  // Core Web Vitals: default ON in the browser. Fully fail-open — collection
+  // never affects the host page, and emission happens on pagehide/hidden.
+  const teardownWebVitals = options.enableWebVitals === false ? () => {} : installWebVitalsHook();
+
   // Return a teardown function
   return () => {
     window.onerror = prevOnError;
     window.onunhandledrejection = prevOnUnhandledRejection;
     removeSessionHooks();
+    teardownWebVitals();
   };
+}
+
+/** Start Core Web Vitals collection, never throwing into the host install. */
+function installWebVitalsHook(): () => void {
+  try {
+    return initWebVitals();
+  } catch {
+    return () => {};
+  }
 }
 
 /**

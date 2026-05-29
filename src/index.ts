@@ -13,6 +13,8 @@ import {
   type ScopeUser,
   type ScopeBreadcrumb,
 } from './scope';
+import { initWebVitals } from './web-vitals';
+import { instrumentFetch } from './fetch-instrumentation';
 
 export {
   AllStakNextClient,
@@ -61,7 +63,18 @@ export {
 export { AllStakErrorBoundary, withAllStakErrorBoundary, type AllStakErrorBoundaryProps } from './error-boundary';
 export { registerAllStak, type RegisterAllStakOptions } from './instrumentation';
 export { captureUnderscoreErrorException, type NextErrorContext } from './pages-error';
-export { installGlobalErrorHandlers } from './client-hooks';
+export { installGlobalErrorHandlers, type GlobalErrorHandlerOptions } from './client-hooks';
+export {
+  initWebVitals,
+  reportWebVitals,
+  type WebVitalName,
+  type NextWebVitalsMetric,
+} from './web-vitals';
+export {
+  instrumentFetch,
+  uninstrumentFetch,
+  isFetchInstrumented,
+} from './fetch-instrumentation';
 export { withAllStakMiddleware } from './middleware';
 export {
   withAllStakRouteHandler,
@@ -103,6 +116,20 @@ export interface AllStakNextConfig {
    * object set via `setUser` is never value-scrubbed.
    */
   sendDefaultPii?: boolean;
+  /**
+   * Collect Core Web Vitals (LCP/CLS/INP/FCP/TTFB) via PerformanceObserver and
+   * emit them as `web.vital` spans. Default TRUE in browser contexts (a no-op on
+   * the server/edge). Set false to opt out of the automatic observers.
+   */
+  enableWebVitals?: boolean;
+  /**
+   * Instrument the global `fetch` to capture OUTBOUND HTTP requests
+   * (`direction:'outbound'`) and inject W3C `traceparent` + `baggage` headers so
+   * distributed traces survive the first downstream hop. Works in node server,
+   * edge, and browser. The SDK's own ingest host is always skipped. Default
+   * true. Set false to opt out. Fully fail-open.
+   */
+  enableOutboundHttp?: boolean;
 }
 
 export interface SourceMapUploadOptions {
@@ -134,7 +161,29 @@ export function initAllStakNext(config: AllStakNextConfig): void {
       enableOfflineQueue: config.enableOfflineQueue,
       offlineSpoolDir: config.offlineSpoolDir,
       sendDefaultPii: config.sendDefaultPii,
+      enableOutboundHttp: config.enableOutboundHttp,
     }));
+  }
+
+  // Browser-side instrumentation: Core Web Vitals (default on) and the outbound
+  // fetch wrapper (default on). Both are fully fail-open and no-ops on the
+  // server/edge. On the server/edge the outbound wrapper is installed by
+  // registerAllStak instead.
+  if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+    if (config.enableWebVitals !== false) {
+      try {
+        initWebVitals();
+      } catch {
+        // fail-open
+      }
+    }
+    if (config.enableOutboundHttp !== false) {
+      try {
+        instrumentFetch();
+      } catch {
+        // fail-open
+      }
+    }
   }
 }
 

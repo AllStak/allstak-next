@@ -1,4 +1,5 @@
 import { AllStakNextClient, AllStakNextClientOptions, setClient, getClient } from './client';
+import { instrumentFetch } from './fetch-instrumentation';
 
 export interface RegisterAllStakOptions extends AllStakNextClientOptions {
   /** Capture uncaughtException on the server. Defaults to true. */
@@ -28,6 +29,18 @@ export function registerAllStak(options: RegisterAllStakOptions): AllStakNextCli
 
   const client = new AllStakNextClient(options);
   setClient(client);
+
+  // Outbound HTTP instrumentation (node server + edge): wrap global fetch to
+  // emit direction:'outbound' requests and propagate trace headers downstream.
+  // Default on; fully fail-open. The browser wires this via initAllStakNext /
+  // installGlobalErrorHandlers instead.
+  if (options.enableOutboundHttp !== false) {
+    try {
+      instrumentFetch();
+    } catch {
+      // fail-open
+    }
+  }
 
   const captureUncaught = options.captureUncaughtExceptions !== false;
   const captureRejections = options.captureUnhandledRejections !== false;

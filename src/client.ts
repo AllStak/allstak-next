@@ -125,6 +125,41 @@ export interface SpanPayload {
   data: string;
 }
 
+/**
+ * A span emitted to `/ingest/v1/spans` that carries a numeric `measurements`
+ * map (the wire shape the backend `PerformanceRepository` reads). Used for Core
+ * Web Vitals, which are ingested AS SPANS with `op="web.vital"`: the backend
+ * classifies op IN ('pageload','navigation','browser.resource','web.vital') as
+ * the "web" category and persists the `measurements` column to ClickHouse,
+ * which is how vitals reach the web-vitals dashboard.
+ *
+ * This is a superset of {@link SpanPayload} aligned with the backend SpanItem
+ * shape: it adds `op`, `measurements`, `sessionId`, and `platform`, and most
+ * descriptive fields are optional so a lean vitals span stays small.
+ */
+export interface WebVitalSpan {
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  /** Canonical operation name, e.g. `web.vital`. */
+  operation: string;
+  /** Short op alias mirroring `operation` (backend reads `op`). */
+  op: string;
+  description?: string;
+  status?: 'ok' | 'error' | 'timeout';
+  durationMs: number;
+  startTimeMillis: number;
+  endTimeMillis: number;
+  service?: string;
+  environment?: string;
+  release?: string;
+  sessionId?: string;
+  platform?: string;
+  /** Numeric metric values, e.g. `{ LCP: 1234.5, CLS: 0.02 }`. */
+  measurements: Record<string, number>;
+  attributes?: Record<string, unknown>;
+}
+
 export interface HttpRequestPayload {
   traceId: string;
   requestId: string;
@@ -212,6 +247,14 @@ export interface AllStakNextClientOptions {
   offlineSpoolDir?: string;
   /** Override the offline store bounds (count / bytes / age). */
   offlineQueueLimits?: Partial<OfflineQueueLimits>;
+  /**
+   * Instrument the global `fetch` to capture OUTBOUND HTTP requests
+   * (`direction:'outbound'`) and inject W3C `traceparent` + `baggage` headers on
+   * the outbound request so distributed traces survive the first downstream
+   * hop. The SDK's own ingest host is always skipped (no recursion). Default
+   * true. Set false to opt out. Fully fail-open.
+   */
+  enableOutboundHttp?: boolean;
   /**
    * Send personally-identifiable information that the SDK would otherwise scrub
    * from free-text VALUES. Default FALSE (Sentry parity). The redaction layers:
@@ -528,6 +571,26 @@ export class AllStakNextClient {
     await this.send('/ingest/v1/spans', { spans: [span] });
   }
 
+  /**
+   * Emit a span carrying a numeric `measurements` map (Core Web Vitals). Filled
+   * in here from client state — environment, release, session id, and the
+   * detected platform (`browser`/`edge`/`node`) — unless the caller overrode
+   * them. Routed through the standard span endpoint and transport (scrub →
+   * deliver → persist-on-failure), so vitals reach the web-vitals dashboard.
+   */
+  async captureWebVital(span: WebVitalSpan): Promise<void> {
+    if (this.destroyed || !this.apiKey) return;
+    await this.send('/ingest/v1/spans', {
+      spans: [{
+        ...span,
+        environment: span.environment ?? this.environment,
+        release: span.release ?? this.release,
+        sessionId: span.sessionId ?? this.sessionId,
+        platform: span.platform ?? this.platform,
+      }],
+    });
+  }
+
   async captureRequest(request: HttpRequestPayload): Promise<void> {
     if (this.destroyed || !this.apiKey) return;
     await this.send('/ingest/v1/http-requests', {
@@ -621,6 +684,16 @@ export class AllStakNextClient {
     return this.release;
   }
 
+  /** Detected runtime platform for this client: `browser`, `edge`, or `node`. */
+  getPlatform(): string {
+    return this.platform;
+  }
+
+  /** Normalized ingest host (no trailing slash). Used to skip self-instrumentation. */
+  getHost(): string {
+    return this.host;
+  }
+
   private async send(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
     const request = this.doFetch(path, payload, timeoutMs);
     this.pendingRequests.push(request);
@@ -630,8 +703,10 @@ export class AllStakNextClient {
   /**
    * Scrub a wire payload to its serialized body. One chokepoint protects every
    * telemetry type. Pure (no caller mutation), fail-open on sanitizer error.
-   * Restores the SDK's own top-level `sessionId` correlation id that the
-   * substring denylist would otherwise redact.
+   * Restores the SDK's own `sessionId` correlation id — at the top level (errors/
+   * messages/sessions) AND on each entry of a `spans[]` envelope (web.vital
+   * spans) — that the substring denylist would otherwise redact. The sessionId
+   * is the SDK's own session-health correlation id, not user PII.
    */
   private scrubToBody(payload: unknown): string {
     try {
@@ -650,6 +725,7 @@ export class AllStakNextClient {
       ) {
         (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId: string }).sessionId;
       }
+      restoreSpanSessionIds(payload, scrubbed);
       return JSON.stringify(scrubbed);
     } catch {
       return JSON.stringify(payload);
@@ -876,6 +952,28 @@ function detectPlatform(): string {
   if (proc?.versions?.node) return 'node';
   // Edge runtime defines a minimal `process` shim without `versions.node`.
   return proc ? 'edge' : 'browser';
+}
+
+/**
+ * Re-attach the SDK's own `sessionId` to each entry of a `{ spans: [...] }`
+ * envelope after scrubbing. The substring denylist redacts `sessionId`
+ * everywhere (it contains "session"), but on a span it is the SDK's session-
+ * health correlation id — not user PII — and the backend uses it to attribute
+ * the span to a session. Mutates `scrubbed` in place, copying values from the
+ * pre-scrub `original`. Fully defensive: any shape mismatch is a no-op.
+ */
+function restoreSpanSessionIds(original: unknown, scrubbed: unknown): void {
+  const origSpans = (original as { spans?: unknown })?.spans;
+  const scrubbedSpans = (scrubbed as { spans?: unknown })?.spans;
+  if (!Array.isArray(origSpans) || !Array.isArray(scrubbedSpans)) return;
+  const len = Math.min(origSpans.length, scrubbedSpans.length);
+  for (let i = 0; i < len; i++) {
+    const o = origSpans[i] as { sessionId?: unknown } | null;
+    const s = scrubbedSpans[i] as { sessionId?: unknown } | null;
+    if (o && s && typeof o === 'object' && typeof s === 'object' && typeof o.sessionId === 'string') {
+      s.sessionId = o.sessionId;
+    }
+  }
 }
 
 /** Runtime-safe session id (uses crypto.randomUUID when available). */

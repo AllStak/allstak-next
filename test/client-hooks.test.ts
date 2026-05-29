@@ -144,3 +144,78 @@ describe('installGlobalErrorHandlers — session end on pagehide', () => {
     expect(listeners['pagehide']).toHaveLength(0);
   });
 });
+
+describe('installGlobalErrorHandlers — web vitals wiring', () => {
+  const docListeners: Record<string, Array<(...a: any[]) => void>> = {};
+  const winListeners: Record<string, Array<(...a: any[]) => void>> = {};
+  let fetchSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    for (const k of Object.keys(docListeners)) delete docListeners[k];
+    for (const k of Object.keys(winListeners)) delete winListeners[k];
+    fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 202, headers: { get: () => null } });
+    vi.stubGlobal('fetch', fetchSpy);
+    // Full browser surface so initWebVitals's isBrowser() returns true.
+    class FakePO {
+      cb: any;
+      constructor(cb: any) { this.cb = cb; }
+      observe() {}
+      disconnect() {}
+    }
+    vi.stubGlobal('PerformanceObserver', FakePO as any);
+    vi.stubGlobal('performance', {
+      getEntriesByType: (t: string) =>
+        t === 'navigation' ? [{ responseStart: 100 }] : t === 'paint' ? [{ name: 'first-contentful-paint', startTime: 50 }] : [],
+    });
+    vi.stubGlobal('location', { href: 'https://example.com/' });
+    vi.stubGlobal('document', {
+      visibilityState: 'hidden',
+      addEventListener: (e: string, h: any) => { (docListeners[e] ??= []).push(h); },
+      removeEventListener: (e: string, h: any) => { docListeners[e] = (docListeners[e] ?? []).filter((x) => x !== h); },
+    });
+    vi.stubGlobal('window', {
+      onerror: null as any,
+      onunhandledrejection: null as any,
+      addEventListener: (e: string, h: any) => { (winListeners[e] ??= []).push(h); },
+      removeEventListener: (e: string, h: any) => { winListeners[e] = (winListeners[e] ?? []).filter((x) => x !== h); },
+    });
+  });
+
+  afterEach(() => {
+    setClient(null);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  function spanCalls() {
+    return fetchSpy.mock.calls.filter(([url]) => String(url).endsWith('/ingest/v1/spans'));
+  }
+
+  it('emits a web.vital span on pagehide by default', async () => {
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    setClient(client);
+
+    const teardown = installGlobalErrorHandlers();
+    // The web-vitals hook registered its own pagehide listener.
+    expect(winListeners['pagehide']?.length).toBeGreaterThan(0);
+    for (const h of winListeners['pagehide']) h();
+    await client.flush();
+
+    const span = JSON.parse(spanCalls()[0][1].body).spans[0];
+    expect(span.op).toBe('web.vital');
+    expect(span.platform).toBe('browser');
+    teardown();
+  });
+
+  it('does NOT collect web vitals when enableWebVitals is false', async () => {
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    setClient(client);
+
+    const teardown = installGlobalErrorHandlers({ enableWebVitals: false });
+    for (const h of winListeners['pagehide'] ?? []) h();
+    await client.flush();
+
+    expect(spanCalls()).toHaveLength(0);
+    teardown();
+  });
+});
