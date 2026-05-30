@@ -95,6 +95,22 @@ describe('@allstak/next manual capture + scope', () => {
     expect(ev.release).toBe('r1');
   });
 
+  it('initAllStakNext passes beforeSend into the registered client', async () => {
+    const calls = captureFetch();
+    initAllStakNext({
+      apiKey: 'ask_dev_test',
+      host: 'https://api.allstak.sa',
+      beforeSend: (event) => ({
+        ...event,
+        metadata: { ...event.metadata, initHookRan: true, token: 'secret-token-from-hook' },
+      }),
+    });
+    await captureException(new Error('via init beforeSend'));
+    const meta = errors(calls)[0].body.metadata;
+    expect(meta.initHookRan).toBe(true);
+    expect(JSON.stringify(meta)).not.toContain('secret-token-from-hook');
+  });
+
   it('setUser / setTag / setContext / setExtra attach to captured events', async () => {
     const calls = captureFetch();
     register();

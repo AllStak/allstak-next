@@ -30,6 +30,20 @@
 
 export const REDACTED = '[REDACTED]';
 
+let redactionCount = 0;
+
+export function getSanitizerRedactionCount(): number {
+  return redactionCount;
+}
+
+export function resetSanitizerRedactionCountForTest(): void {
+  redactionCount = 0;
+}
+
+function recordRedaction(): void {
+  redactionCount += 1;
+}
+
 // Canonical 25-term denylist (case-insensitive substring match on keys).
 export const DEFAULT_DENYLIST = [
   'authorization',
@@ -185,16 +199,32 @@ export function scrubStringValue(input: string, sendDefaultPii: boolean): string
       // CC: redact only runs that pass Luhn (preserve order ids/timestamps).
       out = out.replace(CC_CANDIDATE, (match) => {
         const digits = match.replace(/[ -]/g, '');
-        return luhnValid(digits) ? REDACTED : match;
+        if (luhnValid(digits)) {
+          recordRedaction();
+          return REDACTED;
+        }
+        return match;
       });
-      out = out.replace(SSN, REDACTED);
+      out = out.replace(SSN, () => {
+        recordRedaction();
+        return REDACTED;
+      });
     }
 
     // (B) Unless the host explicitly opted into PII.
     if (!sendDefaultPii) {
-      if (out.includes('@')) out = out.replace(EMAIL, REDACTED);
-      if (out.includes('.')) out = out.replace(IPV4, REDACTED);
-      if (out.includes(':')) out = out.replace(IPV6, REDACTED);
+      if (out.includes('@')) out = out.replace(EMAIL, () => {
+        recordRedaction();
+        return REDACTED;
+      });
+      if (out.includes('.')) out = out.replace(IPV4, () => {
+        recordRedaction();
+        return REDACTED;
+      });
+      if (out.includes(':')) out = out.replace(IPV6, () => {
+        recordRedaction();
+        return REDACTED;
+      });
     }
 
     return out;
@@ -277,6 +307,7 @@ function walk(value: unknown, ctx: WalkContext, valueScrubExempt: boolean): unkn
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
     if (isSensitive(k, ctx.denylist)) {
+      recordRedaction();
       out[k] = REDACTED;
       continue;
     }

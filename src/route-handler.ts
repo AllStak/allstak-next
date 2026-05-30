@@ -125,11 +125,14 @@ export function withAllStakServerAction<TArgs extends unknown[], TResult>(
 export function createRouteTelemetryContext(request: RouteRequest): RouteTelemetryContext {
   const parsed = parseRequestUrl(request.url);
   const incoming = readIncomingTrace(request.headers);
+  const customTraceId = validTraceId(readHeader(request.headers, 'x-allstak-trace-id'))
+    ?? validTraceId(readHeader(request.headers, 'x-trace-id'));
+  const customParentSpanId = validSpanId(readHeader(request.headers, 'x-allstak-parent-span-id'));
   return {
-    traceId: readHeader(request.headers, 'x-allstak-trace-id') ?? incoming.traceId ?? generateTraceId(),
+    traceId: incoming.traceId ?? customTraceId ?? generateTraceId(),
     requestId: readHeader(request.headers, 'x-allstak-request-id') ?? readHeader(request.headers, 'x-request-id') ?? generateTraceId(),
     spanId: generateSpanId(),
-    parentSpanId: readHeader(request.headers, 'x-allstak-parent-span-id') ?? incoming.parentSpanId ?? '',
+    parentSpanId: incoming.parentSpanId ?? customParentSpanId ?? '',
     method: (request.method || 'GET').toUpperCase(),
     host: parsed.host,
     path: parsed.path,
@@ -262,9 +265,12 @@ function parseRequestUrl(url: string | undefined): { host: string; path: string 
 
 function readIncomingTrace(headers: Headers | undefined): { traceId?: string; parentSpanId?: string } {
   const traceparent = headers?.get('traceparent');
-  const match = traceparent?.match(/^[\da-f]{2}-([\da-f]{32})-([\da-f]{16})-[\da-f]{2}$/i);
+  const match = traceparent?.match(/^00-([\da-f]{32})-([\da-f]{16})-[\da-f]{2}$/i);
   if (!match) return {};
-  return { traceId: match[1].toLowerCase(), parentSpanId: match[2].toLowerCase() };
+  const traceId = match[1].toLowerCase();
+  const parentSpanId = match[2].toLowerCase();
+  if (!validTraceId(traceId) || !validSpanId(parentSpanId)) return {};
+  return { traceId, parentSpanId };
 }
 
 function readHeader(headers: Headers | undefined, name: string): string | undefined {
@@ -272,15 +278,28 @@ function readHeader(headers: Headers | undefined, name: string): string | undefi
   return value && value.trim() ? value.trim() : undefined;
 }
 
+function validTraceId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && /^[0-9a-f]{32}$/.test(normalized) && !/^0{32}$/.test(normalized) ? normalized : undefined;
+}
+
+function validSpanId(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized && /^[0-9a-f]{16}$/.test(normalized) && !/^0{16}$/.test(normalized) ? normalized : undefined;
+}
+
 function generateTraceId(): string {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
-    return crypto.randomUUID().replace(/-/g, '');
+    const id = crypto.randomUUID().replace(/-/g, '').toLowerCase();
+    return /^0{32}$/.test(id) ? `1${id.slice(1)}` : id;
   }
-  return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  const id = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  return /^0{32}$/.test(id) ? `1${id.slice(1)}` : id;
 }
 
 function generateSpanId(): string {
-  return Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  const id = Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
+  return /^0{16}$/.test(id) ? `1${id.slice(1)}` : id;
 }
 
 function toError(error: unknown): Error {

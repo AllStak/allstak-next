@@ -15,6 +15,7 @@ import {
 describe('auto breadcrumbs', () => {
   let fetchSpy: ReturnType<typeof vi.fn>;
   let winListeners: Record<string, Array<(...a: unknown[]) => void>>;
+  let docListeners: Record<string, Array<(...a: unknown[]) => void>>;
   let history: Record<string, unknown>;
   let originalConsole: { info?: unknown; warn?: unknown; error?: unknown; debug?: unknown };
 
@@ -26,6 +27,7 @@ describe('auto breadcrumbs', () => {
     scopeManager.getCurrentScope().clear();
 
     winListeners = {};
+    docListeners = {};
     history = {
       pushState: vi.fn(),
       replaceState: vi.fn(),
@@ -37,7 +39,15 @@ describe('auto breadcrumbs', () => {
       debug: console.debug,
     };
 
-    vi.stubGlobal('document', { visibilityState: 'visible' });
+    vi.stubGlobal('document', {
+      visibilityState: 'visible',
+      addEventListener: (event: string, h: (...a: unknown[]) => void) => {
+        (docListeners[event] ??= []).push(h);
+      },
+      removeEventListener: (event: string, h: (...a: unknown[]) => void) => {
+        docListeners[event] = (docListeners[event] ?? []).filter((x) => x !== h);
+      },
+    });
     vi.stubGlobal('window', {
       addEventListener: (event: string, h: (...a: unknown[]) => void) => {
         (winListeners[event] ??= []).push(h);
@@ -64,6 +74,19 @@ describe('auto breadcrumbs', () => {
 
   function crumbs() {
     return scopeManager.getCurrentScope().breadcrumbs;
+  }
+
+  function el(tagName: string, attrs: Record<string, string> = {}, classes: string[] = []) {
+    return {
+      tagName,
+      classList: classes,
+      parentElement: null,
+      getAttribute: (name: string) => attrs[name] ?? null,
+    };
+  }
+
+  function click(target: unknown) {
+    for (const handler of docListeners.click ?? []) handler({ target });
   }
 
   it('is a no-op outside the browser', () => {
@@ -116,6 +139,49 @@ describe('auto breadcrumbs', () => {
     expect(httpCrumbs[0].message).toContain('POST');
     expect(httpCrumbs[0].message).toContain('api.example.com/things');
     expect(httpCrumbs[0].data).toMatchObject({ status: 200 });
+  });
+
+  it('records privacy-safe click breadcrumbs without text or values', () => {
+    installAutoBreadcrumbs({ navigation: false, console: false, fetch: false });
+
+    click(el('BUTTON', { id: 'pay-now', value: '4111111111111111' }, ['primary', 'checkout']));
+
+    const ui = crumbs().filter((c) => c.type === 'ui');
+    expect(ui).toHaveLength(1);
+    expect(ui[0].message).toBe('click button#pay-now.primary.checkout');
+    expect(ui[0].data).toMatchObject({ action: 'click', selector: 'button#pay-now.primary.checkout', tag: 'button' });
+    expect(JSON.stringify(ui[0])).not.toContain('4111111111111111');
+  });
+
+  it('ignores password input clicks', () => {
+    installAutoBreadcrumbs({ navigation: false, console: false, fetch: false });
+
+    click(el('INPUT', { type: 'password', id: 'password', value: 'secret' }));
+
+    expect(crumbs().filter((c) => c.type === 'ui')).toHaveLength(0);
+  });
+
+  it('truncates long click selectors', () => {
+    installAutoBreadcrumbs({ navigation: false, console: false, fetch: false, maxSelectorLength: 48 });
+
+    click(el('BUTTON', { id: 'x'.repeat(200) }, ['a'.repeat(80)]));
+
+    const ui = crumbs().filter((c) => c.type === 'ui');
+    expect(ui).toHaveLength(1);
+    expect(String(ui[0].data?.selector).length).toBeLessThanOrEqual(48);
+  });
+
+  it('beforeBreadcrumb can drop click breadcrumbs', () => {
+    installAutoBreadcrumbs({
+      navigation: false,
+      console: false,
+      fetch: false,
+      beforeBreadcrumb: () => null,
+    });
+
+    click(el('BUTTON', { id: 'drop-me' }));
+
+    expect(crumbs().filter((c) => c.type === 'ui')).toHaveLength(0);
   });
 
   it('attaches collected breadcrumbs to a captured error', async () => {

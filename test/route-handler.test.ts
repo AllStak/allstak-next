@@ -107,6 +107,49 @@ describe('withAllStakRouteHandler', () => {
     expect(span.parentSpanId).toBe('00f067aa0ba902b7');
   });
 
+  it('ignores invalid trace headers instead of continuing poisoned context', async () => {
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    setClient(client);
+    const headers = new Headers({
+      traceparent: '00-00000000000000000000000000000000-0000000000000000-01',
+      'x-allstak-trace-id': 'not-a-valid-trace-id',
+      'x-allstak-parent-span-id': 'also-invalid',
+    });
+    const wrapped = withAllStakRouteHandler(async () => makeResponse(200));
+
+    const result = await wrapped({ url: 'https://example.com/api/invalid', method: 'GET', headers });
+    await client.flush();
+
+    const traceId = result.headers.get('x-allstak-trace-id');
+    expect(traceId).toMatch(/^[a-f0-9]{32}$/);
+    expect(traceId).not.toBe('00000000000000000000000000000000');
+    const spanCall = fetchSpy.mock.calls.find(([url]) => String(url).endsWith('/ingest/v1/spans'));
+    const span = JSON.parse(spanCall![1].body).spans[0];
+    expect(span.traceId).toBe(traceId);
+    expect(span.parentSpanId).toBe('');
+  });
+
+  it('prefers a valid W3C traceparent over an invalid AllStak trace header', async () => {
+    const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
+    setClient(client);
+    const upstreamTraceId = '0af7651916cd43dd8448eb211c80319c';
+    const upstreamParentSpanId = 'b7ad6b7169203331';
+    const headers = new Headers({
+      traceparent: `00-${upstreamTraceId}-${upstreamParentSpanId}-01`,
+      'x-allstak-trace-id': 'invalid',
+    });
+    const wrapped = withAllStakRouteHandler(async () => makeResponse(200));
+
+    const result = await wrapped({ url: 'https://example.com/api/prefer-w3c', method: 'GET', headers });
+    await client.flush();
+
+    expect(result.headers.get('x-allstak-trace-id')).toBe(upstreamTraceId);
+    const spanCall = fetchSpy.mock.calls.find(([url]) => String(url).endsWith('/ingest/v1/spans'));
+    const span = JSON.parse(spanCall![1].body).spans[0];
+    expect(span.traceId).toBe(upstreamTraceId);
+    expect(span.parentSpanId).toBe(upstreamParentSpanId);
+  });
+
   it('captures route errors with the same trace ids and rethrows', async () => {
     const client = new AllStakNextClient({ apiKey: 'ask_test', host: 'https://api.allstak.sa' });
     const captureSpy = vi.spyOn(client, 'captureException');

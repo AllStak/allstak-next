@@ -1,5 +1,5 @@
 import { resolveDebugId } from './utils/debug-id';
-import { scrub } from './sanitize';
+import { getSanitizerRedactionCount, scrub } from './sanitize';
 import { getActiveMergedScope, type MergedScopeData } from './scope';
 import { resolveRelease, type GitRunner } from './release';
 import {
@@ -16,8 +16,14 @@ const TRANSPORT_TIMEOUT_MS = 3000;
 /** Shorter timeout for the session/end POST so graceful shutdown is never blocked. */
 const SESSION_END_TIMEOUT_MS = 1500;
 const MAX_BREADCRUMBS = 30;
+const COMPRESSION_THRESHOLD_BYTES = 16 * 1024;
 /** Upper bound for any honored Retry-After delay. */
 const MAX_RETRY_AFTER_MS = 300_000;
+const SESSION_STATE_VERSION = 1;
+const SESSION_STATE_PREFIX = 'allstak.next.session.v1';
+const SESSION_STATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_RECOVERY_LOCK_MS = 30_000;
+const SESSION_RECOVERY_MAX_ATTEMPTS = 3;
 const runtimeReleaseRegistrations = new Set<string>();
 
 /**
@@ -68,12 +74,59 @@ export type SeverityLevel = 'fatal' | 'error' | 'warning' | 'info' | 'debug';
  */
 export type SessionStatus = 'ok' | 'errored' | 'crashed' | 'abnormal';
 
+export interface SessionStateStore {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+interface PersistedSessionState {
+  version: 1;
+  sessionId: string;
+  startedAt: number;
+  updatedAt: number;
+  status: SessionStatus;
+  release?: string;
+  environment?: string;
+  userId?: string;
+  sdkName?: string;
+  sdkVersion?: string;
+  platform?: string;
+  closed?: boolean;
+  endedAt?: number;
+  recoveryAttempts?: number;
+  recoveryLockOwner?: string;
+  recoveryLockUntil?: number;
+  recoveredAt?: number;
+}
+
 export interface Breadcrumb {
   timestamp: string;
   type: BreadcrumbType;
   message: string;
   level?: string;
   data?: Record<string, unknown>;
+}
+
+export interface SdkDiagnostics {
+  eventsCaptured: number;
+  eventsSent: number;
+  eventsFailed: number;
+  eventsDropped: number;
+  eventsPersisted: number;
+  eventsReplayed: number;
+  queueSize: number;
+  retryAttempts: number;
+  rateLimitedCount: number;
+  compressedPayloads: number;
+  uncompressedPayloads: number;
+  compressionBytesSaved: number;
+  sanitizerRedactionCount: number;
+  activeTraceCount: number;
+  activeSpanCount: number;
+  breadcrumbCount: number;
+  sessionRecoveryCount: number;
+  disabled: boolean;
 }
 
 export interface StackFrame {
@@ -232,8 +285,9 @@ export interface LogPayload {
 }
 
 /**
- * Outbound error/message event passed to `beforeSend`. This is the
- * fully-built wire payload (before redaction). Returning `null` drops it.
+ * Outbound error/message event passed to `beforeSend`. The SDK sanitizes the
+ * fully-built payload before invoking the hook, then sanitizes again before
+ * persistence/network send. Returning `null` drops it.
  */
 export type AllStakNextEvent = ErrorPayload;
 
@@ -251,10 +305,12 @@ export interface AllStakNextClientOptions {
    */
   sampleRate?: number;
   /**
-   * Called once just before an error/message event is sent. Return the event
-   * (optionally mutated) to send it, or `null` to drop it. Fail-open: if the
-   * callback throws, the original event is sent. Not called for events already
-   * dropped by `sampleRate`.
+   * Called once just before an error/message event is sent. The event passed to
+   * the hook has already been sanitized. Return the event (optionally mutated)
+   * to send it, or `null` to drop it. The returned event is sanitized again
+   * before it can be persisted or sent, so hooks cannot reintroduce sensitive
+   * values. If the callback throws, the pre-sanitized event is sent. Not called
+   * for events already dropped by `sampleRate`.
    */
   beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
   /** RNG seam for deterministic tests. Defaults to Math.random. Returns [0,1). */
@@ -282,6 +338,10 @@ export interface AllStakNextClientOptions {
    * Automatically skipped under a unit-test runtime (NODE_ENV=test / VITEST).
    */
   enableAutoSessionTracking?: boolean;
+  /** @internal test/custom persistence seam for abnormal session recovery. */
+  sessionStateStore?: SessionStateStore | null;
+  /** @internal test/custom key for abnormal session recovery. */
+  sessionStateKey?: string;
   /** Git runner seam for deterministic tests; defaults to a guarded spawnSync. */
   gitRunner?: GitRunner;
   /**
@@ -346,6 +406,19 @@ export class AllStakNextClient {
   private destroyed = false;
   private pendingRequests: Promise<void>[] = [];
 
+  private eventsCaptured = 0;
+  private eventsSent = 0;
+  private eventsFailed = 0;
+  private eventsDropped = 0;
+  private eventsPersisted = 0;
+  private eventsReplayed = 0;
+  private retryAttempts = 0;
+  private rateLimitedCount = 0;
+  private compressedPayloads = 0;
+  private uncompressedPayloads = 0;
+  private compressionBytesSaved = 0;
+  private sessionRecoveryCount = 0;
+
   // ── Offline / persistent event queue (survive restart + outage) ──
   private readonly offlineQueueEnabled: boolean;
   private readonly offlineQueue: OfflineQueue | null;
@@ -360,6 +433,8 @@ export class AllStakNextClient {
   private sessionStatus: SessionStatus = 'ok';
   private sessionStarted = false;
   private sessionEnded = false;
+  private readonly sessionStateStore: SessionStateStore | null;
+  private readonly sessionStateKey: string;
 
   constructor(options: AllStakNextClientOptions) {
     this.apiKey = options.apiKey || options.dsn || '';
@@ -381,6 +456,10 @@ export class AllStakNextClient {
     this.platform = detectPlatform();
     this.sessionId = generateSessionId();
     this.sessionTrackingEnabled = shouldAutoSessionTrack(options.enableAutoSessionTracking);
+    this.sessionStateKey = options.sessionStateKey ?? sessionStateKey(this.host, this.apiKey, this.release);
+    this.sessionStateStore = options.sessionStateStore === undefined
+      ? defaultSessionStateStore()
+      : options.sessionStateStore;
     this.offlineQueueEnabled = shouldEnableOfflineQueue(options.enableOfflineQueue);
     this.offlineQueue = this.offlineQueueEnabled
       ? safeNewOfflineQueue({ spoolDir: options.offlineSpoolDir, limits: options.offlineQueueLimits })
@@ -422,12 +501,14 @@ export class AllStakNextClient {
    */
   startSession(): void {
     if (this.sessionStarted || this.destroyed) return;
+    this.recoverPreviousSession();
     this.sessionStarted = true;
     this.sessionStart = Date.now();
     this.sessionStatus = 'ok';
-    if (!this.apiKey) return;
     const scopeUser = getActiveMergedScope().user;
     const userId = typeof scopeUser?.id === 'string' ? scopeUser.id : undefined;
+    this.writeOpenSessionState(userId);
+    if (!this.apiKey) return;
     const payload: Record<string, unknown> = {
       sessionId: this.sessionId,
       // Release-health needs a non-empty release; fall back to the SDK version.
@@ -450,6 +531,7 @@ export class AllStakNextClient {
    */
   markSessionErrored(): void {
     if (this.sessionStatus === 'ok') this.sessionStatus = 'errored';
+    this.writeOpenSessionState();
   }
 
   /**
@@ -459,6 +541,7 @@ export class AllStakNextClient {
    */
   markSessionCrashed(): void {
     this.sessionStatus = 'crashed';
+    this.writeOpenSessionState();
   }
 
   /**
@@ -470,11 +553,133 @@ export class AllStakNextClient {
   endSession(finalStatus?: SessionStatus): void {
     if (this.sessionEnded || !this.sessionStarted) return;
     this.sessionEnded = true;
-    if (!this.apiKey) return;
     const status = finalStatus ?? this.sessionStatus;
     const durationMs = Math.max(0, Date.now() - this.sessionStart);
+    this.writeClosedSessionState(status);
+    if (!this.apiKey) return;
     const payload = { sessionId: this.sessionId, durationMs, status };
     void this.send('/ingest/v1/sessions/end', payload, SESSION_END_TIMEOUT_MS).catch(() => undefined);
+  }
+
+  private recoverPreviousSession(): void {
+    const previous = this.readSessionState();
+    if (!previous) return;
+    const now = Date.now();
+    if (previous.closed) {
+      this.removeSessionState();
+      return;
+    }
+    if (now - previous.startedAt > SESSION_STATE_MAX_AGE_MS) {
+      this.removeSessionState();
+      return;
+    }
+    if ((previous.recoveryAttempts ?? 0) >= SESSION_RECOVERY_MAX_ATTEMPTS) {
+      this.removeSessionState();
+      return;
+    }
+    if (previous.recoveryLockUntil && previous.recoveryLockUntil > now) return;
+
+    const owner = generateSessionId();
+    const locked: PersistedSessionState = {
+      ...previous,
+      recoveryAttempts: (previous.recoveryAttempts ?? 0) + 1,
+      recoveryLockOwner: owner,
+      recoveryLockUntil: now + SESSION_RECOVERY_LOCK_MS,
+      updatedAt: now,
+    };
+    this.writeSessionState(locked);
+    if (this.readSessionState()?.recoveryLockOwner !== owner) return;
+
+    const status: SessionStatus = previous.status === 'crashed' ? 'crashed' : 'abnormal';
+    try {
+      if (this.apiKey) {
+        void this.send('/ingest/v1/sessions/end', {
+          sessionId: previous.sessionId,
+          durationMs: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, (previous.updatedAt || now) - previous.startedAt)),
+          status,
+        }, SESSION_END_TIMEOUT_MS).catch(() => undefined);
+      }
+      this.writeSessionState({
+        ...locked,
+        status,
+        closed: true,
+        endedAt: now,
+        recoveredAt: now,
+        recoveryLockUntil: 0,
+      });
+      this.sessionRecoveryCount += 1;
+    } catch {
+      this.writeSessionState({ ...locked, recoveryLockUntil: 0 });
+    }
+  }
+
+  private writeOpenSessionState(userId?: string): void {
+    this.writeSessionState({
+      version: SESSION_STATE_VERSION,
+      sessionId: this.sessionId,
+      startedAt: this.sessionStart || Date.now(),
+      updatedAt: Date.now(),
+      status: this.sessionStatus,
+      release: this.release || SDK_VERSION,
+      environment: this.environment,
+      userId,
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
+      platform: this.platform,
+      closed: false,
+    });
+  }
+
+  private writeClosedSessionState(status: SessionStatus): void {
+    this.writeSessionState({
+      version: SESSION_STATE_VERSION,
+      sessionId: this.sessionId,
+      startedAt: this.sessionStart || Date.now(),
+      updatedAt: Date.now(),
+      status,
+      release: this.release || SDK_VERSION,
+      environment: this.environment,
+      sdkName: SDK_NAME,
+      sdkVersion: SDK_VERSION,
+      platform: this.platform,
+      closed: true,
+      endedAt: Date.now(),
+    });
+  }
+
+  private readSessionState(): PersistedSessionState | null {
+    if (!this.sessionStateStore) return null;
+    try {
+      const raw = this.sessionStateStore.getItem(this.sessionStateKey);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!isPersistedSessionState(parsed)) {
+        this.removeSessionState();
+        return null;
+      }
+      return parsed;
+    } catch {
+      this.removeSessionState();
+      return null;
+    }
+  }
+
+  private writeSessionState(state: PersistedSessionState): void {
+    if (!this.sessionStateStore) return;
+    try {
+      this.sessionStateStore.setItem(this.sessionStateKey, JSON.stringify(state));
+    } catch {
+      // fail-open
+    }
+  }
+
+  private removeSessionState(): void {
+    if (!this.sessionStateStore) return;
+    try {
+      this.sessionStateStore.removeItem(this.sessionStateKey);
+    } catch {
+      // ignore
+    }
   }
 
   private registerRuntimeRelease(): void {
@@ -493,17 +698,19 @@ export class AllStakNextClient {
 
   /**
    * Capture-time event pipeline for error/message events:
-   *   sampleRate drop → beforeSend → (transport applies redaction).
+   *   sampleRate drop → pre-hook sanitization → beforeSend → final transport
+   *   sanitization.
    * Returns the event to send, or `null` if it was dropped. `beforeSend` is
-   * fail-open: a throwing callback yields the original event.
+   * fail-open: a throwing callback yields the already-sanitized event.
    */
   private applyEventPipeline(event: AllStakNextEvent): AllStakNextEvent | null {
     if (this.sampleRate < 1 && this.random() >= this.sampleRate) return null;
-    if (!this.beforeSend) return event;
+    const sanitized = this.sanitizePayload(event) as AllStakNextEvent;
+    if (!this.beforeSend) return sanitized;
     try {
-      return this.beforeSend(event) ?? null;
+      return this.beforeSend(sanitized) ?? null;
     } catch {
-      return event; // beforeSend errors must never crash capture
+      return sanitized; // beforeSend errors must never crash capture
     }
   }
 
@@ -548,7 +755,11 @@ export class AllStakNextClient {
   }
 
   async captureException(error: Error, context: Record<string, unknown> = {}): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     const frames = parseStack(error.stack);
 
     // Resolve debug-IDs per frame so the symbolicator can pick the
@@ -589,12 +800,19 @@ export class AllStakNextClient {
     if (isCrashMechanism(context, payload.level)) this.markSessionCrashed();
     else this.markSessionErrored();
     const outbound = this.applyEventPipeline(payload);
-    if (!outbound) return;
+    if (!outbound) {
+      this.eventsDropped += 1;
+      return;
+    }
     await this.send('/ingest/v1/errors', outbound);
   }
 
   async captureMessage(message: string, level: SeverityLevel = 'info'): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     const payload: ErrorPayload = {
       exceptionClass: 'Message',
       message,
@@ -617,12 +835,19 @@ export class AllStakNextClient {
     if (level === 'fatal') this.markSessionCrashed();
     else if (level === 'error') this.markSessionErrored();
     const outbound = this.applyEventPipeline(payload);
-    if (!outbound) return;
+    if (!outbound) {
+      this.eventsDropped += 1;
+      return;
+    }
     await this.send('/ingest/v1/errors', outbound);
   }
 
   async captureSpan(span: SpanPayload): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     await this.send('/ingest/v1/spans', { spans: [span] });
   }
 
@@ -634,7 +859,11 @@ export class AllStakNextClient {
    * deliver → persist-on-failure), so vitals reach the web-vitals dashboard.
    */
   async captureWebVital(span: WebVitalSpan): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     await this.send('/ingest/v1/spans', {
       spans: [{
         ...span,
@@ -647,7 +876,11 @@ export class AllStakNextClient {
   }
 
   async captureRequest(request: HttpRequestPayload): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     await this.send('/ingest/v1/http-requests', {
       requests: [{
         ...request,
@@ -665,7 +898,11 @@ export class AllStakNextClient {
    * blank. Fail-open: never throws into the host query chain.
    */
   async captureDbQuery(query: DbQueryPayload): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     await this.send('/ingest/v1/db', {
       queries: [{
         ...query,
@@ -683,7 +920,11 @@ export class AllStakNextClient {
    * when the caller left them blank. Fail-open.
    */
   async captureLog(log: LogPayload): Promise<void> {
-    if (this.destroyed || !this.apiKey) return;
+    if (this.destroyed || !this.apiKey) {
+      this.eventsDropped += 1;
+      return;
+    }
+    this.eventsCaptured += 1;
     await this.send('/ingest/v1/logs', {
       ...log,
       environment: log.environment ?? this.environment,
@@ -725,7 +966,13 @@ export class AllStakNextClient {
         } catch {
           sent = false;
         }
-        if (!sent) survivors.push(env);
+        if (sent) {
+          this.eventsSent += 1;
+          this.eventsReplayed += 1;
+        } else {
+          this.eventsFailed += 1;
+          survivors.push(env);
+        }
       }
       queue.replaceAll(survivors);
     } catch {
@@ -783,6 +1030,30 @@ export class AllStakNextClient {
     return this.host;
   }
 
+  /** Privacy-safe diagnostics. Contains counters and queue sizes only. */
+  getDiagnostics(): SdkDiagnostics {
+    return {
+      eventsCaptured: this.eventsCaptured,
+      eventsSent: this.eventsSent,
+      eventsFailed: this.eventsFailed,
+      eventsDropped: this.eventsDropped + (this.offlineQueue?.droppedCount() ?? 0),
+      eventsPersisted: this.eventsPersisted,
+      eventsReplayed: this.eventsReplayed,
+      queueSize: this.pendingRequests.length + (this.offlineQueue?.count() ?? 0),
+      retryAttempts: this.retryAttempts,
+      rateLimitedCount: this.rateLimitedCount,
+      compressedPayloads: this.compressedPayloads,
+      uncompressedPayloads: this.uncompressedPayloads,
+      compressionBytesSaved: this.compressionBytesSaved,
+      sanitizerRedactionCount: getSanitizerRedactionCount(),
+      activeTraceCount: 0,
+      activeSpanCount: 0,
+      breadcrumbCount: this.breadcrumbs.length,
+      sessionRecoveryCount: this.sessionRecoveryCount,
+      disabled: this.destroyed || !this.apiKey,
+    };
+  }
+
   private async send(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
     const request = this.doFetch(path, payload, timeoutMs);
     this.pendingRequests.push(request);
@@ -797,7 +1068,7 @@ export class AllStakNextClient {
    * spans) — that the substring denylist would otherwise redact. The sessionId
    * is the SDK's own session-health correlation id, not user PII.
    */
-  private scrubToBody(payload: unknown): string {
+  private sanitizePayload<T>(payload: T): T | { redacted: true; reason: string } {
     try {
       // Key-name redaction (always) PLUS value-pattern PII scrubbing of
       // free-text string values. (A) CC/SSN always; (B) email/IP unless the
@@ -812,13 +1083,17 @@ export class AllStakNextClient {
         payload && typeof payload === 'object' &&
         typeof (payload as { sessionId?: unknown }).sessionId === 'string'
       ) {
-        (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId: string }).sessionId;
+        (scrubbed as { sessionId?: unknown }).sessionId = (payload as { sessionId?: unknown }).sessionId;
       }
       restoreSpanSessionIds(payload, scrubbed);
-      return JSON.stringify(scrubbed);
+      return scrubbed as T;
     } catch {
-      return JSON.stringify(payload);
+      return { redacted: true, reason: 'sanitizer_error' };
     }
+  }
+
+  private scrubToBody(payload: unknown): string {
+    return JSON.stringify(this.sanitizePayload(payload));
   }
 
   private async doFetch(path: string, payload: unknown, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<void> {
@@ -829,7 +1104,13 @@ export class AllStakNextClient {
     // Persist on failure so the event survives a restart/outage. Session
     // lifecycle calls are excluded (handled inside the queue too).
     if (outcome === 'failed' && this.offlineQueue && isPersistablePath(path)) {
-      this.offlineQueue.persist(path, body);
+      if (this.offlineQueue.persist(path, body)) {
+        this.eventsPersisted += 1;
+      } else {
+        this.eventsDropped += 1;
+      }
+    } else if (outcome === 'failed' && isPersistablePath(path)) {
+      this.eventsDropped += 1;
     }
   }
 
@@ -846,18 +1127,29 @@ export class AllStakNextClient {
     try {
       let response = await this.postOnce(path, body, timeoutMs);
       if (response && (response.status === 429 || response.status === 503)) {
+        if (response.status === 429) this.rateLimitedCount += 1;
         const headerValue = response.headers?.get?.('Retry-After') ?? null;
         const waitMs = parseRetryAfter(headerValue, Date.now());
         if (waitMs > 0) {
+          this.retryAttempts += 1;
           await new Promise((r) => setTimeout(r, waitMs));
           response = await this.postOnce(path, body, timeoutMs);
         }
       }
-      return classifyResponse(response);
+      const outcome = classifyResponse(response);
+      this.recordDeliveryOutcome(outcome);
+      return outcome;
     } catch {
       // Network error / timeout / abort — retry-able, persist it.
+      this.eventsFailed += 1;
       return 'failed';
     }
+  }
+
+  private recordDeliveryOutcome(outcome: DeliveryOutcome): void {
+    if (outcome === 'delivered') this.eventsSent += 1;
+    else if (outcome === 'dropped') this.eventsDropped += 1;
+    else this.eventsFailed += 1;
   }
 
   /**
@@ -888,6 +1180,7 @@ export class AllStakNextClient {
       // Keep only the ones that still couldn't be delivered. `delivered` and
       // `dropped` (permanent 4xx) are both removed from the store.
       if (outcome === 'failed') survivors.push(env);
+      else if (outcome === 'delivered') this.eventsReplayed += 1;
     }
     queue.replaceAll(survivors);
   }
@@ -895,19 +1188,88 @@ export class AllStakNextClient {
   private async postOnce(path: string, body: string, timeoutMs: number = TRANSPORT_TIMEOUT_MS): Promise<Response | undefined> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const prepared = await this.prepareRequestBody(body);
     try {
       return await fetch(`${this.host}${path}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-AllStak-Key': this.apiKey,
+          ...prepared.headers,
         },
-        body,
+        body: prepared.body,
         signal: controller.signal,
       });
     } finally {
       clearTimeout(timeoutId);
     }
+  }
+
+  private async prepareRequestBody(body: string): Promise<PreparedBody> {
+    const rawBytes = byteLength(body);
+    if (rawBytes < COMPRESSION_THRESHOLD_BYTES) {
+      this.uncompressedPayloads += 1;
+      return { body, headers: {} };
+    }
+
+    const compressed = await gzipBody(body);
+    if (!compressed || compressed.byteLength >= rawBytes) {
+      this.uncompressedPayloads += 1;
+      return { body, headers: {} };
+    }
+
+    this.compressedPayloads += 1;
+    this.compressionBytesSaved += rawBytes - compressed.byteLength;
+    return {
+      body: compressed as unknown as BodyInit,
+      headers: { 'Content-Encoding': 'gzip' },
+    };
+  }
+}
+
+interface PreparedBody {
+  body: BodyInit;
+  headers: Record<string, string>;
+}
+
+function byteLength(value: string): number {
+  if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(value).byteLength;
+  return value.length;
+}
+
+async function gzipBody(body: string): Promise<Uint8Array | null> {
+  const compressionStream = (globalThis as any).CompressionStream;
+  if (typeof compressionStream === 'function' && typeof Blob !== 'undefined' && typeof Response !== 'undefined') {
+    try {
+      const stream = new Blob([body], { type: 'application/json' })
+        .stream()
+        .pipeThrough(new compressionStream('gzip'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch {
+      // fall through to Node zlib when available
+    }
+  }
+
+  try {
+    const proc = (globalThis as any).process;
+    const zlib = proc?.getBuiltinModule?.('node:zlib') ??
+      optionalRequire('node:zlib') ??
+      optionalRequire('zlib') ??
+      (proc?.versions?.node ? await import('node:zlib').catch(() => null) : null);
+    const compressed = zlib?.gzipSync?.(body);
+    return compressed ? new Uint8Array(compressed) : null;
+  } catch {
+    return null;
+  }
+}
+
+function optionalRequire(id: string): any | null {
+  try {
+    // eslint-disable-next-line no-new-func
+    const req = Function('return typeof require === "function" ? require : undefined')();
+    return typeof req === 'function' ? req(id) : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1071,6 +1433,79 @@ function generateSessionId(): string {
   if (c?.randomUUID) return c.randomUUID();
   return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('');
 }
+
+function isPersistedSessionState(value: unknown): value is PersistedSessionState {
+  if (!value || typeof value !== 'object') return false;
+  const s = value as Partial<PersistedSessionState>;
+  return (
+    s.version === SESSION_STATE_VERSION &&
+    typeof s.sessionId === 'string' &&
+    s.sessionId.length > 0 &&
+    typeof s.startedAt === 'number' &&
+    Number.isFinite(s.startedAt) &&
+    typeof s.updatedAt === 'number' &&
+    Number.isFinite(s.updatedAt) &&
+    (s.status === 'ok' || s.status === 'errored' || s.status === 'crashed' || s.status === 'abnormal')
+  );
+}
+
+function sessionStateKey(host: string, apiKey: string, release: string): string {
+  return `${SESSION_STATE_PREFIX}.${stableHash(`${host}|${apiKey}|${release || SDK_VERSION}`)}`;
+}
+
+function stableHash(input: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16);
+}
+
+function defaultSessionStateStore(): SessionStateStore | null {
+  try {
+    if (!isNodeServer()) return null;
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    if (env?.NODE_ENV === 'test' || env?.VITEST === 'true') return null;
+    const req = typeof require === 'function' ? require : null;
+    if (!req) return null;
+    const fs = req('node:fs') as typeof import('node:fs');
+    const os = req('node:os') as typeof import('node:os');
+    const path = req('node:path') as typeof import('node:path');
+    const dir = path.join(os.tmpdir(), 'allstak-next-session-state');
+    const fileFor = (key: string) => path.join(dir, `${key.replace(/[^a-zA-Z0-9._-]/g, '_')}.json`);
+    return {
+      getItem(key: string) {
+        try {
+          const file = fileFor(key);
+          return fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+        } catch {
+          return null;
+        }
+      },
+      setItem(key: string, value: string) {
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(fileFor(key), value);
+        } catch {
+          // ignore
+        }
+      },
+      removeItem(key: string) {
+        try {
+          const file = fileFor(key);
+          if (fs.existsSync(file)) fs.unlinkSync(file);
+        } catch {
+          // ignore
+        }
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+declare const require: undefined | ((id: string) => any);
 
 /**
  * A captured exception is a session "crash" (vs. a handled "errored") when it

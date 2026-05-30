@@ -53,6 +53,41 @@ describe('AllStakNextClient beforeSend + sampleRate', () => {
       expect(body.message).toBe('payload survives');
     });
 
+    it('passes a sanitized event into beforeSend', async () => {
+      const beforeSend = vi.fn((event) => event);
+      const client = new AllStakNextClient({ ...base, beforeSend });
+      await client.captureException(new Error('password hunter2 token secret-token 4111111111111111'), {
+        Authorization: 'Bearer abc',
+        nested: { apiKey: 'key-123' },
+      });
+
+      const hookEvent = beforeSend.mock.calls[0][0];
+      expect(hookEvent.message).toBe('password hunter2 token secret-token [REDACTED]');
+      expect(hookEvent.metadata.Authorization).toBe('[REDACTED]');
+      expect(hookEvent.metadata.nested.apiKey).toBe('[REDACTED]');
+    });
+
+    it('sanitizes again after beforeSend so hooks cannot reintroduce secrets', async () => {
+      const client = new AllStakNextClient({
+        ...base,
+        beforeSend: (event) => ({
+          ...event,
+          message: 'card 4111111111111111',
+          metadata: {
+            ...event.metadata,
+            Authorization: 'Bearer abc',
+            nested: { token: 'secret-token' },
+          },
+        }),
+      });
+      await client.captureException(new Error('original'));
+
+      const body = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(body.message).toBe('card [REDACTED]');
+      expect(body.metadata.Authorization).toBe('[REDACTED]');
+      expect(body.metadata.nested.token).toBe('[REDACTED]');
+    });
+
     it('runs beforeSend once per captured event', async () => {
       const beforeSend = vi.fn((event) => event);
       const client = new AllStakNextClient({ ...base, beforeSend });

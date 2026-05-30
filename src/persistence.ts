@@ -337,6 +337,7 @@ function defaultSpoolDir(): string | null {
 export class OfflineQueue {
   private readonly adapter: PersistenceAdapter;
   private readonly limits: OfflineQueueLimits;
+  private dropped = 0;
 
   constructor(options: OfflineQueueOptions = {}) {
     this.adapter = selectAdapter(options);
@@ -356,14 +357,18 @@ export class OfflineQueue {
    * Persist a single scrubbed envelope. Session lifecycle paths are silently
    * ignored. Never throws. Enforces the bounds (drop oldest).
    */
-  persist(path: string, body: string): void {
-    if (!isPersistablePath(path)) return;
+  persist(path: string, body: string): boolean {
+    if (!isPersistablePath(path)) return false;
     try {
       const envelopes = this.bound(this.adapter.load());
-      envelopes.push({ path, body, ts: Date.now() });
-      this.adapter.save(this.bound(envelopes));
+      const next = this.bound([...envelopes, { path, body, ts: Date.now() }]);
+      this.dropped += Math.max(0, envelopes.length + 1 - next.length);
+      this.adapter.save(next);
+      return next.some((e) => e.path === path && e.body === body);
     } catch {
       // fail-open
+      this.dropped += 1;
+      return false;
     }
   }
 
@@ -392,6 +397,14 @@ export class OfflineQueue {
     } catch {
       // fail-open
     }
+  }
+
+  count(): number {
+    return this.loadAll().length;
+  }
+
+  droppedCount(): number {
+    return this.dropped;
   }
 
   /**

@@ -18,6 +18,9 @@
  */
 
 import { scopeManager } from './scope';
+import type { ScopeBreadcrumb } from './scope';
+
+export type BeforeBreadcrumb = (breadcrumb: ScopeBreadcrumb) => ScopeBreadcrumb | null | undefined;
 
 export interface BreadcrumbCollectorOptions {
   /** Record `console.*` calls as breadcrumbs. Default true. */
@@ -26,10 +29,18 @@ export interface BreadcrumbCollectorOptions {
   navigation?: boolean;
   /** Record outbound fetch calls (method + URL + status). Default true. */
   fetch?: boolean;
+  /** Record privacy-safe UI click breadcrumbs. Default true. */
+  click?: boolean;
+  /** Last-mile hook to edit/drop auto breadcrumbs before they are stored. */
+  beforeBreadcrumb?: BeforeBreadcrumb;
+  /** Maximum selector summary length for click breadcrumbs. Default 160. */
+  maxSelectorLength?: number;
 }
 
 interface CollectorState {
   teardowns: Array<() => void>;
+  beforeBreadcrumb?: BeforeBreadcrumb;
+  maxSelectorLength: number;
 }
 
 let state: CollectorState | null = null;
@@ -40,7 +51,9 @@ function isBrowser(): boolean {
 
 function addCrumb(type: string, message: string, level: string, data?: Record<string, unknown>): void {
   try {
-    scopeManager.getCurrentScope().addBreadcrumb({ type, category: type, message, level, data });
+    const crumb: ScopeBreadcrumb = { type, category: type, message, level, data };
+    const finalCrumb = state?.beforeBreadcrumb ? state.beforeBreadcrumb(crumb) : crumb;
+    if (finalCrumb) scopeManager.getCurrentScope().addBreadcrumb(finalCrumb);
   } catch {
     // fail-open
   }
@@ -55,11 +68,16 @@ export function installAutoBreadcrumbs(options: BreadcrumbCollectorOptions = {})
   if (!isBrowser()) return () => {};
   if (state) return () => teardownAll();
 
-  state = { teardowns: [] };
+  state = {
+    teardowns: [],
+    beforeBreadcrumb: options.beforeBreadcrumb,
+    maxSelectorLength: Math.max(32, options.maxSelectorLength ?? 160),
+  };
 
   if (options.console !== false) safeInstall(installConsoleBreadcrumbs);
   if (options.navigation !== false) safeInstall(installNavigationBreadcrumbs);
   if (options.fetch !== false) safeInstall(installFetchBreadcrumbs);
+  if (options.click !== false) safeInstall(installClickBreadcrumbs);
 
   return () => teardownAll();
 }
@@ -87,6 +105,128 @@ function teardownAll(): void {
     }
   }
   state = null;
+}
+
+// ── click ───────────────────────────────────────────────────────────────────
+
+function installClickBreadcrumbs(): () => void {
+  const doc = document as Document & {
+    addEventListener?: Document['addEventListener'];
+    removeEventListener?: Document['removeEventListener'];
+  };
+  if (typeof doc.addEventListener !== 'function') return () => {};
+
+  const handler = (event: Event) => {
+    try {
+      const rawTarget = (event as { target?: unknown }).target;
+      const target = closestClickable(rawTarget);
+      if (!target || isSensitiveClickable(target)) return;
+      const selector = selectorSummary(target, state?.maxSelectorLength ?? 160);
+      if (!selector) return;
+      addCrumb('ui', `click ${selector}`, 'info', {
+        action: 'click',
+        selector,
+        tag: tagName(target),
+      });
+    } catch {
+      // fail-open
+    }
+  };
+
+  doc.addEventListener('click', handler, true);
+  return () => {
+    try {
+      doc.removeEventListener?.('click', handler, true);
+    } catch {
+      // fail-open
+    }
+  };
+}
+
+function closestClickable(target: unknown): Element | null {
+  let el = asElement(target);
+  while (el) {
+    const tag = tagName(el);
+    if (
+      tag === 'button' ||
+      tag === 'a' ||
+      tag === 'input' ||
+      tag === 'select' ||
+      tag === 'textarea' ||
+      attr(el, 'role') === 'button' ||
+      attr(el, 'data-allstak-click') !== null
+    ) {
+      return el;
+    }
+    el = asElement((el as { parentElement?: unknown }).parentElement);
+  }
+  return asElement(target);
+}
+
+function asElement(value: unknown): Element | null {
+  if (!value || typeof value !== 'object') return null;
+  const maybe = value as { tagName?: unknown; nodeType?: unknown };
+  return typeof maybe.tagName === 'string' || maybe.nodeType === 1 ? value as Element : null;
+}
+
+function isSensitiveClickable(el: Element): boolean {
+  const tag = tagName(el);
+  if (tag !== 'input') return false;
+  const type = (attr(el, 'type') ?? '').toLowerCase();
+  return type === 'password' || type === 'hidden';
+}
+
+function selectorSummary(el: Element, maxLength: number): string {
+  const tag = tagName(el) || 'element';
+  const parts = [tag];
+  const id = cleanSelectorPart(attr(el, 'id'));
+  if (id) parts.push(`#${id}`);
+
+  const classes = classNames(el).slice(0, 3).map(cleanSelectorPart).filter(Boolean);
+  if (classes.length) parts.push(classes.map((c) => `.${c}`).join(''));
+
+  const role = cleanSelectorPart(attr(el, 'role'));
+  if (role) parts.push(`[role="${role}"]`);
+
+  const type = cleanSelectorPart(attr(el, 'type'));
+  if (type && tag === 'input') parts.push(`[type="${type}"]`);
+
+  return truncate(parts.join(''), maxLength);
+}
+
+function tagName(el: Element): string {
+  return ((el as { tagName?: string }).tagName ?? '').toLowerCase();
+}
+
+function attr(el: Element, name: string): string | null {
+  try {
+    const getter = (el as { getAttribute?: (n: string) => string | null }).getAttribute;
+    if (typeof getter === 'function') return getter.call(el, name);
+    const value = (el as unknown as Record<string, unknown>)[name];
+    return typeof value === 'string' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function classNames(el: Element): string[] {
+  try {
+    const list = (el as { classList?: Iterable<string>; className?: unknown }).classList;
+    if (list) return Array.from(list).filter((v): v is string => typeof v === 'string');
+    const className = (el as { className?: unknown }).className;
+    return typeof className === 'string' ? className.split(/\s+/).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function cleanSelectorPart(value: string | null): string {
+  if (!value) return '';
+  return value.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length > maxLength ? `${value.slice(0, Math.max(0, maxLength - 1))}…` : value;
 }
 
 // ── console ──────────────────────────────────────────────────────────────────

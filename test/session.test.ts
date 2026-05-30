@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { AllStakNextClient, SDK_NAME, SDK_VERSION, setClient } from '../src/client';
+import { AllStakNextClient, SDK_NAME, SDK_VERSION, setClient, type SessionStateStore } from '../src/client';
 
 /**
  * Release-health session tracking ("one session per process / app-launch").
@@ -29,6 +29,14 @@ describe('release-health session tracking', () => {
   function bodyOf(path: string) {
     const call = callsTo(path)[0];
     return call ? JSON.parse(call[1].body) : undefined;
+  }
+  function makeStore(initial?: string): SessionStateStore & { value: string | null } {
+    return {
+      value: initial ?? null,
+      getItem: vi.fn(function (this: { value: string | null }) { return this.value; }),
+      setItem: vi.fn(function (this: { value: string | null }, _key: string, value: string) { this.value = value; }),
+      removeItem: vi.fn(function (this: { value: string | null }) { this.value = null; }),
+    };
   }
 
   it('POSTs sessions/start at init with the documented payload shape', async () => {
@@ -213,6 +221,151 @@ describe('release-health session tracking', () => {
     const endCalls = callsTo('/ingest/v1/sessions/end');
     expect(endCalls).toHaveLength(1);
     expect(JSON.parse(endCalls[0][1].body).status).toBe('ok');
+  });
+
+  it('does not recover abnormal after a clean session shutdown', async () => {
+    const store = makeStore();
+    const key = 'allstak.next.session.clean';
+    const first = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    first.endSession();
+    await first.flush();
+    fetchSpy.mockClear();
+
+    const second = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    await second.flush();
+
+    expect(callsTo('/ingest/v1/sessions/end')).toHaveLength(0);
+    expect(callsTo('/ingest/v1/sessions/start')).toHaveLength(1);
+  });
+
+  it('recovers a previous open session as abnormal', async () => {
+    const store = makeStore();
+    const key = 'allstak.next.session.abnormal';
+    const first = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    const previousId = first.getSessionId();
+    await first.flush();
+    fetchSpy.mockClear();
+
+    const second = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    await second.flush();
+
+    const recovered = bodyOf('/ingest/v1/sessions/end');
+    expect(recovered).toMatchObject({ sessionId: previousId, status: 'abnormal' });
+  });
+
+  it('recovers a previous crashed session as crashed', async () => {
+    const store = makeStore();
+    const key = 'allstak.next.session.crashed';
+    const first = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    const previousId = first.getSessionId();
+    await first.captureException(new Error('fatal'), { mechanism: 'uncaughtException' });
+    await first.flush();
+    fetchSpy.mockClear();
+
+    const second = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    await second.flush();
+
+    const recovered = bodyOf('/ingest/v1/sessions/end');
+    expect(recovered).toMatchObject({ sessionId: previousId, status: 'crashed' });
+  });
+
+  it('drops corrupt session state safely', async () => {
+    const store = makeStore('{not-json');
+    const client = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: 'allstak.next.session.corrupt',
+    });
+    await client.flush();
+
+    expect(callsTo('/ingest/v1/sessions/end')).toHaveLength(0);
+    expect(callsTo('/ingest/v1/sessions/start')).toHaveLength(1);
+  });
+
+  it('does not duplicate a recovered abnormal session report', async () => {
+    const store = makeStore();
+    const key = 'allstak.next.session.dedupe';
+    new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    fetchSpy.mockClear();
+
+    const second = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    second.endSession();
+    await second.flush();
+    expect(callsTo('/ingest/v1/sessions/end').map(([, init]) => JSON.parse(init.body).status))
+      .toContain('abnormal');
+    fetchSpy.mockClear();
+
+    const third = new AllStakNextClient({
+      apiKey: 'ask_test',
+      host: 'https://api.allstak.sa',
+      release: '1.0.0',
+      enableAutoSessionTracking: true,
+      sessionStateStore: store,
+      sessionStateKey: key,
+    });
+    await third.flush();
+
+    expect(callsTo('/ingest/v1/sessions/end').map(([, init]) => JSON.parse(init.body).status))
+      .not.toContain('abnormal');
   });
 
   it('start failure never throws into init (fail-open)', () => {

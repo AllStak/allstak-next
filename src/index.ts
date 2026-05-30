@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 // Restores the public API that shipped on @allstak/next@0.1.0; the
 // short-circuit publish of 0.1.1 missed these because index.ts didn't
 // re-export from the freshly-tracked source files.
-import { AllStakNextClient, getClient, setClient, type SeverityLevel, type LogLevel } from './client';
+import { AllStakNextClient, getClient, setClient, type AllStakNextEvent, type SeverityLevel, type LogLevel, type SdkDiagnostics } from './client';
 import {
   Scope,
   scopeManager,
@@ -15,7 +15,7 @@ import {
 } from './scope';
 import { initWebVitals } from './web-vitals';
 import { instrumentFetch } from './fetch-instrumentation';
-import { installAutoBreadcrumbs } from './breadcrumbs';
+import { installAutoBreadcrumbs, type BeforeBreadcrumb } from './breadcrumbs';
 import { installConsoleLogBridge, logToAllStak } from './logs';
 
 export {
@@ -38,6 +38,7 @@ export {
   type DbQueryPayload,
   type LogLevel,
   type LogPayload,
+  type SdkDiagnostics,
   _resetRuntimeReleaseRegistrationForTest,
 } from './client';
 export { Scope } from './scope';
@@ -112,6 +113,7 @@ export {
 export {
   installAutoBreadcrumbs,
   areAutoBreadcrumbsInstalled,
+  type BeforeBreadcrumb,
   type BreadcrumbCollectorOptions,
 } from './breadcrumbs';
 export {
@@ -124,6 +126,12 @@ const DEFAULT_HOST = 'https://api.allstak.sa';
 
 export interface AllStakNextConfig {
   apiKey?: string;
+  /**
+   * Backward-compatible alias for apiKey. The runtime client already supports
+   * this; keeping it in the public config type prevents wizard-generated
+   * instrumentation from failing TypeScript builds.
+   */
+  dsn?: string;
   host?: string;
   environment?: string;
   release?: string;
@@ -173,6 +181,10 @@ export interface AllStakNextConfig {
    * opt out.
    */
   enableAutoBreadcrumbs?: boolean;
+  /** Capture privacy-safe click breadcrumbs. Default TRUE with auto breadcrumbs. */
+  enableClickBreadcrumbs?: boolean;
+  /** Edit/drop auto breadcrumbs before storing them. Must not return sensitive data. */
+  beforeBreadcrumb?: BeforeBreadcrumb;
   /**
    * Bridge `console.{debug,info,warn,error}` to `/ingest/v1/logs` so existing
    * `console.*` calls become structured logs (error+Error promoted to an
@@ -180,6 +192,12 @@ export interface AllStakNextConfig {
    * false to opt out.
    */
   enableConsoleLogs?: boolean;
+  /**
+   * Last-mile event hook for compatibility with the base SDKs. The SDK runs
+   * sanitization before this hook and again before persistence/network send, so
+   * a hook cannot reintroduce secrets into stored or transmitted events.
+   */
+  beforeSend?: (event: AllStakNextEvent) => AllStakNextEvent | null;
 }
 
 export interface SourceMapUploadOptions {
@@ -192,8 +210,10 @@ export interface SourceMapUploadOptions {
 }
 
 export function initAllStakNext(config: AllStakNextConfig): void {
+  const apiKey = config.apiKey || config.dsn;
   (globalThis as typeof globalThis & { __ALLSTAK_NEXT__?: AllStakNextConfig }).__ALLSTAK_NEXT__ = {
     ...config,
+    apiKey,
     host: (config.host || DEFAULT_HOST).replace(/\/$/, ''),
   };
   // Register a real client so the module-level captureException/captureMessage
@@ -201,9 +221,9 @@ export function initAllStakNext(config: AllStakNextConfig): void {
   // sampling, beforeSend, redaction) instead of the old raw-fetch shadow.
   // Skip if a client was already registered (e.g. via registerAllStak).
   const existing = getClient();
-  if ((!existing || existing.isDestroyed()) && config.apiKey) {
+  if ((!existing || existing.isDestroyed()) && apiKey) {
     setClient(new AllStakNextClient({
-      apiKey: config.apiKey,
+      apiKey,
       host: config.host,
       environment: config.environment,
       release: config.release,
@@ -212,6 +232,7 @@ export function initAllStakNext(config: AllStakNextConfig): void {
       offlineSpoolDir: config.offlineSpoolDir,
       sendDefaultPii: config.sendDefaultPii,
       enableOutboundHttp: config.enableOutboundHttp,
+      beforeSend: config.beforeSend,
     }));
   }
 
@@ -237,7 +258,10 @@ export function initAllStakNext(config: AllStakNextConfig): void {
     }
     if (config.enableAutoBreadcrumbs !== false) {
       try {
-        installAutoBreadcrumbs();
+        installAutoBreadcrumbs({
+          click: config.enableClickBreadcrumbs,
+          beforeBreadcrumb: config.beforeBreadcrumb,
+        });
       } catch {
         // fail-open
       }
@@ -289,6 +313,12 @@ export async function captureMessage(message: string, level: SeverityLevel = 'in
   const client = getClient();
   if (!client || client.isDestroyed()) return;
   await client.captureMessage(message, level);
+}
+
+/** Privacy-safe SDK diagnostics for the registered client. */
+export function getDiagnostics(): SdkDiagnostics | null {
+  const client = getClient();
+  return client?.getDiagnostics() ?? null;
 }
 
 // ── Module-level scope API ──────────────────────────────────────────────────
